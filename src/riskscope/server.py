@@ -7,7 +7,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service
+from .service import RiskError, Service
 
 
 def env_address() -> tuple[str, int]:
@@ -34,6 +34,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.service.health())
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def do_POST(self) -> None:
+        if self.path != "/market-risk/historical-var":
+            self.send_json(
+                404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}}
+            )
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self.send_json(
+                400,
+                {"error": {"code": "invalid_request", "message": "request body must be valid JSON"}},
+            )
+            return
+        if not isinstance(payload, dict):
+            self.send_json(
+                400,
+                {"error": {"code": "invalid_request", "message": "request body must be a JSON object"}},
+            )
+            return
+        try:
+            result = self.service.historical_var(payload)
+        except RiskError as err:
+            self.send_json(err.status, {"error": {"code": err.code, "message": err.message}})
+            return
+        self.send_json(200, result)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
