@@ -7,7 +7,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service
+from .service import Service, ServiceError
 
 
 def env_address() -> tuple[str, int]:
@@ -34,6 +34,29 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.service.health())
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def do_POST(self) -> None:
+        if self.path != "/market-risk/historical-var":
+            self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self.send_json(
+                400,
+                {"error": {"code": "invalid_request", "message": "invalid Content-Length"}},
+            )
+            return
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            result = self.service.historical_var(raw)
+        except ServiceError as exc:
+            self.send_json(
+                exc.status,
+                {"error": {"code": exc.code, "message": exc.message}},
+            )
+            return
+        self.send_json(200, result)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
