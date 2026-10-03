@@ -78,6 +78,25 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 令 n 为观察数、x 为突破数、`p = 1 - confidence`，按规格公式计算 `kupiec.lr_statistic`（`0·ln0` 按 0 计算，舍入导致的微小负值按 0 处理），`kupiec.p_value = erfc(sqrt(lr_statistic/2))`；`kupiec.accepted` 仅在 `p_value >= significance` 时为 `true`。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_observation`（date 重复）、`413 request_too_large`（超过 10000 条观察；边界值允许处理）。
 
+## 协方差估计
+
+`POST /market-risk/covariance-estimate` 根据同步风险因子收益率估计样本均值、协方差、波动率与相关系数：
+
+```json
+{
+  "factors": ["eq", "ir"],
+  "observations": [
+    {"date": "2024-01-01", "factor_returns": {"eq": 0.01, "ir": 0.02}},
+    {"date": "2024-01-02", "factor_returns": {"eq": 0.03, "ir": -0.01}},
+    {"date": "2024-01-03", "factor_returns": {"eq": -0.02, "ir": 0.0}}
+  ]
+}
+```
+
+- `factors` 为非空数组，因子名为唯一非空字符串，其顺序决定全部输出向量与矩阵的行列位置；`observations` 至少两条，每条含唯一非空 `date` 与覆盖全部声明因子的 `factor_returns`，未声明因子及其他字段忽略。收益率接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数。
+- 响应回显 `factors` 并返回 `observation_count`、`means`、`volatilities`、`covariance_matrix`、`correlation_matrix`。均值为算术平均；协方差为去均值乘积之和除以 n-1；波动率为协方差对角元素的非负平方根；相关系数为协方差除以两侧波动率，零波动因子与其他因子为 0.0、自身为 1.0。矩阵对称，计算不按 `date` 排序；任一计算出现非有限值时整次失败，不返回部分结果。
+- 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空集合、类型错误、收益率非法、观察不足）、`422 duplicate_factor`、`422 duplicate_observation`、`422 missing_factor`、`413 request_too_large`（因子超过 100 个、观察超过 10000 条，或因子数 × 观察数超过 1000000；边界值允许处理）。
+
 ## 交易对手信用敞口与预期信用损失
 
 `POST /credit-risk/counterparty-exposure` 按净额结算集汇总交易敞口并计算预期损失：
@@ -132,4 +151,4 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、交易对手信用敞口与流动性缺口分析的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口与流动性缺口分析的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
