@@ -9,7 +9,9 @@ bucket lives behind :meth:`Service.liquidity_gap`. Sample covariance
 estimation from synchronized factor returns lives behind
 :meth:`Service.covariance_estimate`. Zero-mean Delta-Normal
 (parametric) VaR and expected shortfall live behind
-:meth:`Service.parametric_var`. The public surface stays
+:meth:`Service.parametric_var`. Cross-book, multi-currency
+position aggregation with FX conversion lives behind
+:meth:`Service.portfolio_aggregate`. The public surface stays
 backward compatible.
 """
 
@@ -31,6 +33,8 @@ MAX_FACTORS = 100
 MAX_FACTOR_OBSERVATION_PAIRS = 1000000
 MAX_POSITIONS = 10000
 MAX_FACTOR_POSITION_PAIRS = 1000000
+MAX_FX_RATES = 1000
+MAX_SENSITIVITY_ENTRIES = 1000000
 
 # Relative tolerance for covariance-matrix symmetry, positive
 # semidefiniteness, and the tiny negative variance that floating-point
@@ -283,6 +287,21 @@ class Service:
         raise :class:`InvalidInput`.
         """
         return self._liquidity_gap(self._load_object(raw))
+
+    def portfolio_aggregate(self, raw: bytes | str) -> dict:
+        """Validate a portfolio aggregation request and compute it.
+
+        Positions from arbitrary books and currencies are converted into
+        the ``reporting_currency`` — ``fx_rates`` gives the amount of
+        reporting currency one unit of a source currency buys — and rolled
+        up by currency, by book, and for the whole portfolio. The reporting
+        currency's own rate is implicitly 1 and may only be supplied
+        explicitly as 1; rates no position references are ignored. Negative
+        amounts stay negative. Parse failures and non-object payloads raise
+        :class:`InvalidRequest`; semantic problems raise
+        :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._portfolio_aggregate(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -1337,4 +1356,184 @@ class Service:
             "currency": currency,
             "buckets": buckets,
             "earliest_shortfall": earliest_shortfall,
+        }
+
+    def _portfolio_aggregate(self, payload: dict) -> dict:
+        reporting_currency = payload.get("reporting_currency")
+        if not _is_nonempty_str(reporting_currency):
+            raise InvalidInput()
+
+        fx_rates_raw = payload.get("fx_rates")
+        if not isinstance(fx_rates_raw, dict):
+            raise InvalidInput()
+        if len(fx_rates_raw) > MAX_FX_RATES:
+            raise RequestTooLarge(f"at most {MAX_FX_RATES} fx rates are allowed")
+
+        positions_raw = payload.get("positions")
+        if not isinstance(positions_raw, list) or len(positions_raw) == 0:
+            raise InvalidInput()
+        if len(positions_raw) > MAX_POSITIONS:
+            raise RequestTooLarge(f"at most {MAX_POSITIONS} positions are allowed")
+        positions: list[dict] = []
+        sensitivity_entries = 0
+        for position in positions_raw:
+            if not isinstance(position, dict):
+                raise InvalidInput()
+            position_id = position.get("id")
+            if not _is_nonempty_str(position_id):
+                raise InvalidInput()
+            book = position.get("book")
+            if not _is_nonempty_str(book):
+                raise InvalidInput()
+            currency = position.get("currency")
+            if not _is_nonempty_str(currency):
+                raise InvalidInput()
+            market_value = _strict_float(position.get("market_value"))
+            sensitivities_raw = position.get("sensitivities")
+            if not isinstance(sensitivities_raw, dict) or len(sensitivities_raw) == 0:
+                raise InvalidInput()
+            # Narrow once so conversion can never hit an oversized int.
+            sensitivities: dict[str, float] = {}
+            for factor, value in sensitivities_raw.items():
+                if not _is_nonempty_str(factor):
+                    raise InvalidInput()
+                sensitivities[factor] = _strict_float(value)
+            sensitivity_entries += len(sensitivities)
+            if sensitivity_entries > MAX_SENSITIVITY_ENTRIES:
+                raise RequestTooLarge(
+                    f"at most {MAX_SENSITIVITY_ENTRIES} sensitivity entries "
+                    "are allowed"
+                )
+            positions.append(
+                {
+                    "id": position_id,
+                    "book": book,
+                    "currency": currency,
+                    "market_value": market_value,
+                    "sensitivities": sensitivities,
+                }
+            )
+
+        seen_position_ids: set[str] = set()
+        for position in positions:
+            if position["id"] in seen_position_ids:
+                raise InvalidInput("duplicate_position", "position ids must be unique")
+            seen_position_ids.add(position["id"])
+
+        # The reporting currency converts at an implied rate of 1; an
+        # explicit rate is accepted only when it says exactly that. Rates
+        # for currencies no position references are ignored entirely.
+        if reporting_currency in fx_rates_raw:
+            reporting_rate = _strict_float(fx_rates_raw[reporting_currency])
+            if reporting_rate != 1.0:
+                raise InvalidInput(
+                    message="the reporting currency fx rate must be 1"
+                )
+        fx_rates = {reporting_currency: 1.0}
+        for position in positions:
+            currency = position["currency"]
+            if currency in fx_rates:
+                continue
+            if currency not in fx_rates_raw:
+                raise InvalidInput(
+                    "missing_fx_rate",
+                    f"no fx rate for currency {currency!r}",
+                )
+            rate = _strict_float(fx_rates_raw[currency])
+            if rate <= 0.0:
+                raise InvalidInput(message="fx rates must be positive")
+            fx_rates[currency] = rate
+
+        def non_finite() -> InvalidInput:
+            return InvalidInput(
+                message="aggregation produced a non-finite result"
+            )
+
+        # Convert every position once, then roll the converted amounts into
+        # the currency and book partitions in first-appearance order.
+        currency_rollups: dict[str, dict] = {}
+        book_rollups: dict[str, dict] = {}
+        for position in positions:
+            rate = fx_rates[position["currency"]]
+            converted_market_value = position["market_value"] * rate
+            if not math.isfinite(converted_market_value):
+                raise non_finite()
+            converted_sensitivities: dict[str, float] = {}
+            for factor, value in position["sensitivities"].items():
+                converted = value * rate
+                if not math.isfinite(converted):
+                    raise non_finite()
+                converted_sensitivities[factor] = converted
+            for key, rollups in (
+                (position["currency"], currency_rollups),
+                (position["book"], book_rollups),
+            ):
+                rollup = rollups.get(key)
+                if rollup is None:
+                    rollup = {
+                        "position_count": 0,
+                        "converted_market_value": 0.0,
+                        "converted_sensitivities": {},
+                    }
+                    rollups[key] = rollup
+                rollup["position_count"] += 1
+                rollup["converted_market_value"] += converted_market_value
+                if not math.isfinite(rollup["converted_market_value"]):
+                    raise non_finite()
+                sensitivities_rollup = rollup["converted_sensitivities"]
+                for factor, converted in converted_sensitivities.items():
+                    accumulated = sensitivities_rollup.get(factor, 0.0) + converted
+                    if not math.isfinite(accumulated):
+                        raise non_finite()
+                    sensitivities_rollup[factor] = accumulated
+
+        # The portfolio totals are the sequential sum of the currency
+        # details in currency order, so the identity between the levels is
+        # exact; factors keep first-appearance order across positions and a
+        # zero total never drops a factor.
+        total_market_value = 0.0
+        for rollup in currency_rollups.values():
+            total_market_value += rollup["converted_market_value"]
+            if not math.isfinite(total_market_value):
+                raise non_finite()
+        total_sensitivities: dict[str, float] = {}
+        for position in positions:
+            for factor in position["sensitivities"]:
+                if factor not in total_sensitivities:
+                    total_sensitivities[factor] = 0.0
+        for factor in total_sensitivities:
+            total = 0.0
+            for rollup in currency_rollups.values():
+                if factor in rollup["converted_sensitivities"]:
+                    total += rollup["converted_sensitivities"][factor]
+                    if not math.isfinite(total):
+                        raise non_finite()
+            total_sensitivities[factor] = total
+
+        return {
+            "reporting_currency": reporting_currency,
+            "position_count": len(positions),
+            "currencies": [
+                {
+                    "currency": currency,
+                    "fx_rate": fx_rates[currency],
+                    "position_count": rollup["position_count"],
+                    "converted_market_value": rollup["converted_market_value"],
+                    "converted_sensitivities": rollup["converted_sensitivities"],
+                }
+                for currency, rollup in currency_rollups.items()
+            ],
+            "books": [
+                {
+                    "book": book,
+                    "position_count": rollup["position_count"],
+                    "converted_market_value": rollup["converted_market_value"],
+                    "converted_sensitivities": rollup["converted_sensitivities"],
+                }
+                for book, rollup in book_rollups.items()
+            ],
+            "portfolio_totals": {
+                "converted_market_value": total_market_value,
+                "converted_sensitivities": total_sensitivities,
+            },
         }
