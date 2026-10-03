@@ -78,6 +78,30 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 令 n 为观察数、x 为突破数、`p = 1 - confidence`，按规格公式计算 `kupiec.lr_statistic`（`0·ln0` 按 0 计算，舍入导致的微小负值按 0 处理），`kupiec.p_value = erfc(sqrt(lr_statistic/2))`；`kupiec.accepted` 仅在 `p_value >= significance` 时为 `true`。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_observation`（date 重复）、`413 request_too_large`（超过 10000 条观察；边界值允许处理）。
 
+## 交易对手信用敞口与预期信用损失
+
+`POST /credit-risk/counterparty-exposure` 按结算集净额汇总交易敞口，再按交易对手的 PD/LGD 计算预期信用损失：
+
+```json
+{
+  "currency": "USD",
+  "counterparties": [
+    {"id": "cp1", "pd": 0.02, "lgd": 0.6}
+  ],
+  "netting_sets": [
+    {"id": "ns1", "counterparty_id": "cp1", "collateral": 5.0}
+  ],
+  "trades": [
+    {"id": "t1", "netting_set_id": "ns1", "mtm": 10.0, "add_on": 2.0}
+  ]
+}
+```
+
+- `currency` 为非空字符串，省略时取 `USD`。`counterparties`、`netting_sets`、`trades` 均为非空数组。交易对手含非空 `id`、闭区间 `[0, 1]` 内的 `pd` 与 `lgd`；结算集含非空 `id`、引用存在交易对手的 `counterparty_id` 与非负 `collateral`；交易含非空 `id`、引用存在结算集的 `netting_set_id`、有限 `mtm` 与非负有限 `add_on`。数值接受整数但拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 每个结算集：`gross_exposure` 为所属交易 `max(mtm, 0)` 之和，`net_mtm` 为 `mtm` 之和，`potential_future_exposure` 为 `add_on` 之和，`exposure_at_default = max(net_mtm + potential_future_exposure - collateral, 0)`，`expected_loss = exposure_at_default × pd × lgd`。超额抵押只把违约敞口截断为零，不产生负敞口；`net_mtm` 仍按原值报告。
+- 响应回显 `currency`，按输入顺序返回 `netting_set_results`（每个结算集含 `id`、五项金额指标与 `trade_count`，与请求 `netting_sets` 同序，交易对手归属可由同序的 `counterparty_id` 得到）；已声明但没有交易的结算集保留全部零值。`counterparty_totals` 按交易对手输入顺序汇总，`portfolio_totals` 为组合总计；组合总计严格等于各结算集明细之和（同一折叠次序，逐位相等），交易对手汇总是同一笔钱的不同分组，已对齐到该总计（float64 能精确表达划分时逐位相等，否则相差至多数个 ulp）。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、类型或范围错误、引用不存在、非有限计算结果）、`422 duplicate_trade`、`422 duplicate_netting_set`、`422 duplicate_counterparty`（对应 id 重复）、`413 request_too_large`（trades 超过 10000 条或 netting_sets 超过 1000 个；边界值允许处理）。
+
 ## 验证
 
 ```bash
