@@ -103,10 +103,34 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 响应回显 `currency`，按输入顺序返回 `netting_sets` 明细（含 `trade_count`，无交易的已声明结算集保留零值），按交易对手输入顺序返回 `counterparties` 汇总金额，并返回 `portfolio_totals`；各层总计等于对应明细之和。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、类型或范围错误、引用不存在、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_counterparty`、`422 duplicate_netting_set`、`422 duplicate_trade`、`413 request_too_large`（交易超过 10000 条或结算集超过 1000 个；边界值允许处理）。
 
+## 流动性资金缺口与变现折扣
+
+`POST /liquidity-risk/liquidity-gap` 按期限桶衡量净现金流缺口，并用折后流动资产衡量所需融资：
+
+```json
+{
+  "currency": "USD",
+  "buckets": [1, 7, 30],
+  "cashflows": [
+    {"id": "cf-1", "day": 2, "amount": -100.0},
+    {"id": "cf-2", "day": 7, "amount": 40.0}
+  ],
+  "liquid_assets": [
+    {"id": "cash", "market_value": 80.0, "haircut": 0.0, "available_day": 0},
+    {"id": "bonds", "market_value": 200.0, "haircut": 0.1, "available_day": 7}
+  ]
+}
+```
+
+- `currency` 省略时为 `USD`，否则须为非空字符串；`buckets` 为非空、严格递增且不重复的正整数天数；`cashflows` 为非空数组，每项含唯一非空 `id`、正整数 `day` 与有限 `amount`（正为流入、负为流出）；`liquid_assets` 省略时为空数组，每项含唯一非空 `id`、非负有限 `market_value`、位于 [0, 1] 的 `haircut` 与非负整数 `available_day`。布尔值、非有限数、NaN/Infinity 与超大整数均无效；额外字段忽略。
+- 现金流归入首个不小于其 `day` 的桶，晚于最终桶日的现金流无效；资产自首个不小于 `available_day` 的桶起计入可用流动性（晚于最终桶日则永不贡献），折后金额为 `market_value × (1 - haircut)`，并在后续桶中持续可用。
+- 响应回显 `currency`，`buckets` 按期限返回各桶的 `day`、`net_cashflow`、`cumulative_net_cashflow`、`available_liquidity`（截至该桶累计可用的折后资产）、`surplus = cumulative_net_cashflow + available_liquidity` 与 `required_funding = max(-surplus, 0)`（空桶零值保留）；`earliest_shortfall` 取首个负 `surplus` 桶的 `day` 与 `required_funding`，无缺口时为 `null`，并列时较早期限优先，恰好为零不算缺口。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、桶顺序错误、现金流超期、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_cashflow`（现金流 id 重复）、`422 duplicate_asset`（资产 id 重复）。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验与交易对手信用敞口的行为均已冻结，后续能力（如流动性风险等）须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、交易对手信用敞口与流动性资金缺口的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。

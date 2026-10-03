@@ -41,6 +41,7 @@ class Handler(BaseHTTPRequestHandler):
             "/market-risk/stress-test",
             "/market-risk/var-backtest",
             "/credit-risk/counterparty-exposure",
+            "/liquidity-risk/liquidity-gap",
         ):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
@@ -60,6 +61,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.var_backtest(raw)
             elif self.path == "/credit-risk/counterparty-exposure":
                 result = self.service.counterparty_exposure(raw)
+            elif self.path == "/liquidity-risk/liquidity-gap":
+                result = self.service.liquidity_gap(raw)
             else:
                 result = self.service.stress_test(raw)
         except ServiceError as exc:

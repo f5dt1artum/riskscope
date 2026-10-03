@@ -4,14 +4,16 @@ The frozen baseline reports process health; historical-simulation VaR and
 expected shortfall now live behind :meth:`Service.historical_var` and batch
 sensitivity stress tests behind :meth:`Service.stress_test`. Counterparty
 credit exposure and expected loss live behind
-:meth:`Service.counterparty_exposure`. The public surface stays backward
-compatible.
+:meth:`Service.counterparty_exposure`. Term-bucket liquidity gaps and
+haircut-adjusted funding shortfalls live behind
+:meth:`Service.liquidity_gap`. The public surface stays backward compatible.
 """
 
 from __future__ import annotations
 
 import json
 import math
+from bisect import bisect_left
 from decimal import Decimal, ROUND_CEILING
 
 from . import __version__
@@ -212,6 +214,21 @@ class Service:
         :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._counterparty_exposure(self._load_object(raw))
+
+    def liquidity_gap(self, raw: bytes | str) -> dict:
+        """Validate a liquidity-gap request and compute the funding profile.
+
+        Cash flows slot into the first bucket whose ``day`` is not earlier
+        than the flow day; flows beyond the last bucket are invalid. Liquid
+        assets become available from the first bucket at or after
+        ``available_day`` at ``market_value * (1 - haircut)``. Per bucket the
+        response reports the net flow, cumulative net flow, cumulative
+        available liquidity, their sum (``surplus``) and the funding required
+        to keep the surplus non-negative. Parse failures and non-object
+        payloads raise :class:`InvalidRequest`; semantic problems raise
+        :class:`InvalidInput`.
+        """
+        return self._liquidity_gap(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -784,4 +801,161 @@ class Service:
             "netting_sets": netting_set_metrics,
             "counterparties": counterparty_metrics,
             "portfolio_totals": portfolio_totals,
+        }
+
+    def _liquidity_gap(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not _is_nonempty_str(currency):
+            raise InvalidInput()
+
+        buckets_raw = payload.get("buckets")
+        if not isinstance(buckets_raw, list) or len(buckets_raw) == 0:
+            raise InvalidInput()
+        bucket_days: list[int] = []
+        for value in buckets_raw:
+            # Bucket days are exact positive integers: bools, floats and
+            # non-integral numbers are all rejected.
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise InvalidInput()
+            if bucket_days and value <= bucket_days[-1]:
+                raise InvalidInput()
+            bucket_days.append(value)
+
+        cashflows_raw = payload.get("cashflows")
+        if not isinstance(cashflows_raw, list) or len(cashflows_raw) == 0:
+            raise InvalidInput()
+        cashflows: list[dict] = []
+        for item in cashflows_raw:
+            if not isinstance(item, dict):
+                raise InvalidInput()
+            flow_id = item.get("id")
+            if not _is_nonempty_str(flow_id):
+                raise InvalidInput()
+            day = item.get("day")
+            if isinstance(day, bool) or not isinstance(day, int) or day < 1:
+                raise InvalidInput()
+            amount = _strict_float(item.get("amount"))
+            cashflows.append({"id": flow_id, "day": day, "amount": amount})
+
+        liquid_assets_raw = payload.get("liquid_assets", [])
+        if not isinstance(liquid_assets_raw, list):
+            raise InvalidInput()
+        liquid_assets: list[dict] = []
+        for item in liquid_assets_raw:
+            if not isinstance(item, dict):
+                raise InvalidInput()
+            asset_id = item.get("id")
+            if not _is_nonempty_str(asset_id):
+                raise InvalidInput()
+            market_value = _strict_float(item.get("market_value"))
+            if market_value < 0.0:
+                raise InvalidInput()
+            haircut = _strict_float(item.get("haircut"))
+            if not 0.0 <= haircut <= 1.0:
+                raise InvalidInput()
+            available_day = item.get("available_day")
+            if (
+                isinstance(available_day, bool)
+                or not isinstance(available_day, int)
+                or available_day < 0
+            ):
+                raise InvalidInput()
+            liquid_assets.append(
+                {
+                    "id": asset_id,
+                    "market_value": market_value,
+                    "haircut": haircut,
+                    "available_day": available_day,
+                }
+            )
+
+        seen_flow_ids: set[str] = set()
+        for flow in cashflows:
+            if flow["id"] in seen_flow_ids:
+                raise InvalidInput(
+                    "duplicate_cashflow", "cashflow ids must be unique"
+                )
+            seen_flow_ids.add(flow["id"])
+
+        seen_asset_ids: set[str] = set()
+        for asset in liquid_assets:
+            if asset["id"] in seen_asset_ids:
+                raise InvalidInput("duplicate_asset", "asset ids must be unique")
+            seen_asset_ids.add(asset["id"])
+
+        bucket_count = len(bucket_days)
+        net_by_bucket = [0.0] * bucket_count
+        for flow in cashflows:
+            index = bisect_left(bucket_days, flow["day"])
+            if index == bucket_count:
+                raise InvalidInput(
+                    message="cashflow day is later than the last bucket"
+                )
+            net_by_bucket[index] += flow["amount"]
+            if not math.isfinite(net_by_bucket[index]):
+                raise InvalidInput(
+                    message="liquidity computation produced a non-finite result"
+                )
+
+        # Assets land once, on the first bucket at or after availability;
+        # availability beyond the last bucket simply never contributes.
+        additions_by_bucket = [0.0] * bucket_count
+        for asset in liquid_assets:
+            index = bisect_left(bucket_days, asset["available_day"])
+            if index == bucket_count:
+                continue
+            discounted = asset["market_value"] * (1.0 - asset["haircut"])
+            if not math.isfinite(discounted):
+                raise InvalidInput(
+                    message="liquidity computation produced a non-finite result"
+                )
+            additions_by_bucket[index] += discounted
+            if not math.isfinite(additions_by_bucket[index]):
+                raise InvalidInput(
+                    message="liquidity computation produced a non-finite result"
+                )
+
+        results: list[dict] = []
+        cumulative_net = 0.0
+        available_liquidity = 0.0
+        earliest_shortfall: dict | None = None
+        for index, day in enumerate(bucket_days):
+            cumulative_net += net_by_bucket[index]
+            available_liquidity += additions_by_bucket[index]
+            surplus = cumulative_net + available_liquidity
+            required_funding = max(-surplus, 0.0)
+            for value in (cumulative_net, available_liquidity, surplus, required_funding):
+                if not math.isfinite(value):
+                    raise InvalidInput(
+                        message="liquidity computation produced a non-finite result"
+                    )
+            # Canonicalize the floored value so an exactly-balanced bucket
+            # never reports -0.0.
+            net = net_by_bucket[index] + 0.0
+            cumulative_net = cumulative_net + 0.0
+            available_liquidity = available_liquidity + 0.0
+            surplus = surplus + 0.0
+            required_funding = required_funding + 0.0
+            results.append(
+                {
+                    "day": day,
+                    "net_cashflow": net,
+                    "cumulative_net_cashflow": cumulative_net,
+                    "available_liquidity": available_liquidity,
+                    "surplus": surplus,
+                    "required_funding": required_funding,
+                }
+            )
+            # Buckets iterate earliest first, so the first negative surplus
+            # wins; an exactly zero surplus is not a shortfall.
+            if earliest_shortfall is None and surplus < 0.0:
+                earliest_shortfall = {
+                    "day": day,
+                    "required_funding": required_funding,
+                }
+
+        return {
+            "currency": currency,
+            "buckets": results,
+            "earliest_shortfall": earliest_shortfall,
         }
