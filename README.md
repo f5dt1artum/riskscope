@@ -56,10 +56,32 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 任何中间计算产生非有限数值时整次失败，不返回部分结果。
 - 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型错误、空集合、NaN/Infinity、计算溢出）、`422 duplicate_position`、`422 duplicate_scenario`、`413 request_too_large`（场景超过 1000 个，或场景数 × 头寸数超过 100000；边界值允许处理）。
 
+## VaR 回溯检验
+
+`POST /market-risk/var-backtest` 对逐日 VaR 预测与已实现损益做突破判定并执行 Kupiec 无条件覆盖检验：
+
+```json
+{
+  "confidence": 0.95,
+  "significance": 0.05,
+  "currency": "USD",
+  "observations": [
+    {"date": "2024-01-01", "var": 10.0, "realized_pnl": 5.0},
+    {"date": "2024-01-02", "var": 10.0, "realized_pnl": -15.0}
+  ]
+}
+```
+
+- `confidence` 严格位于 (0, 1)；`significance` 省略时为 `0.05`，否则严格位于 (0, 1)；`currency` 省略时为 `USD`，否则须为非空字符串。`observations` 为 2 至 10000 条；额外字段忽略。
+- 每条观察的 `date` 唯一非空，`var` 为非负有限数，`realized_pnl` 为有限数；接受整数但拒绝布尔值、NaN、Infinity 与超大整数。
+- 令 `loss = -realized_pnl`，仅当 `loss > var` 时 `breach` 为 `true`，相等不突破。响应按输入顺序返回含 `date`、`var`、`realized_pnl`、`loss`、`breach` 的明细，并给出 `observation_count`、`breach_count`、`breach_rate`，回显 `currency`、`confidence`、`significance`。
+- 令 n 为观察数、x 为突破数、`p = 1 - confidence`，按规格公式计算 `kupiec.lr_statistic`（`0·ln0` 按 0 计算，舍入导致的微小负值按 0 处理），`kupiec.p_value = erfc(sqrt(lr_statistic/2))`；`kupiec.accepted` 仅在 `p_value >= significance` 时为 `true`。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_observation`（date 重复）、`413 request_too_large`（超过 10000 条观察；边界值允许处理）。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失与批量敏感度压力测试的行为均已冻结，后续能力（如回溯检验、信用敞口等）须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试与 VaR 回溯检验的行为均已冻结，后续能力（如信用敞口等）须从这些已冻结事实出发独立设计并验证。

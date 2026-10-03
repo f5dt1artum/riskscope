@@ -134,6 +134,24 @@ def _as_float(value: object) -> float:
     return result
 
 
+def _strict_float(value: object) -> float:
+    """Narrow to a finite float demanding a JSON number type.
+
+    Unlike :func:`_as_float`, numeric-looking strings are rejected (only
+    ``int``/``float`` pass), and oversized integers surface cleanly even
+    though :func:`math.isfinite` raises ``OverflowError`` on them.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidInput()
+    try:
+        result = float(value)
+    except OverflowError:
+        raise InvalidInput()
+    if not math.isfinite(result):
+        raise InvalidInput()
+    return result
+
+
 class Service:
     """Risk engine service."""
 
@@ -163,6 +181,19 @@ class Service:
         raise :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._stress_test(self._load_object(raw))
+
+    def var_backtest(self, raw: bytes | str) -> dict:
+        """Validate a VaR backtesting request and run the Kupiec POF test.
+
+        Each observation pairs a daily VaR forecast with realized P&L; a
+        breach is ``-realized_pnl > var`` (equality does not breach). The
+        Kupiec unconditional-coverage likelihood-ratio statistic compares
+        the breach rate with the predicted tail probability ``1 -
+        confidence``. Parse failures and non-object payloads raise
+        :class:`InvalidRequest`; semantic problems raise
+        :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._var_backtest(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -300,6 +331,112 @@ class Service:
                 {"date": observations[i][0], "loss": losses[i]} for i in range(count)
             ],
             "factor_expected_shortfall_contributions": contributions,
+        }
+
+    @staticmethod
+    def _kupiec_term(count: int, probability: float) -> float:
+        """One ``count * ln(probability)`` log-likelihood term.
+
+        ``0 * ln 0`` is defined as 0 here, so boundary outcomes (no breach
+        or every day breaching) stay well defined. A positive count paired
+        with a zero probability is an infinite (non-finite) term.
+        """
+        if count == 0:
+            return 0.0
+        if probability <= 0.0 or probability > 1.0:
+            raise InvalidInput(message="backtest computation produced a non-finite result")
+        return count * math.log(probability)
+
+    def _var_backtest(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not isinstance(currency, str) or len(currency) == 0:
+            raise InvalidInput()
+
+        confidence = _strict_float(payload.get("confidence"))
+        if not 0 < confidence < 1:
+            raise InvalidInput()
+
+        significance = _strict_float(payload.get("significance", 0.05))
+        if not 0 < significance < 1:
+            raise InvalidInput()
+
+        observations_raw = payload.get("observations")
+        if not isinstance(observations_raw, list):
+            raise InvalidInput()
+        if len(observations_raw) > MAX_OBSERVATIONS:
+            raise RequestTooLarge(f"at most {MAX_OBSERVATIONS} observations are allowed")
+        if len(observations_raw) < 2:
+            raise InvalidInput()
+
+        rows: list[dict] = []
+        dates: list[str] = []
+        for observation in observations_raw:
+            if not isinstance(observation, dict):
+                raise InvalidInput()
+            date = observation.get("date")
+            if not _is_nonempty_str(date):
+                raise InvalidInput()
+            var = _strict_float(observation.get("var"))
+            if var < 0.0:
+                raise InvalidInput()
+            realized_pnl = _strict_float(observation.get("realized_pnl"))
+            loss = -realized_pnl
+            if not math.isfinite(loss):
+                raise InvalidInput()
+            dates.append(date)
+            rows.append(
+                {
+                    "date": date,
+                    "var": var,
+                    "realized_pnl": realized_pnl,
+                    "loss": loss,
+                    "breach": loss > var,
+                }
+            )
+
+        seen_dates: set[str] = set()
+        for date in dates:
+            if date in seen_dates:
+                raise InvalidInput("duplicate_observation", "observation dates must be unique")
+            seen_dates.add(date)
+
+        n = len(rows)
+        x = sum(1 for row in rows if row["breach"])
+        breach_rate = x / n
+
+        # Kupiec (1995) proportion-of-failures unconditional-coverage test.
+        p = 1.0 - confidence
+        q = x / n
+        constrained = self._kupiec_term(n - x, 1.0 - p) + self._kupiec_term(x, p)
+        unconstrained = self._kupiec_term(n - x, 1.0 - q) + self._kupiec_term(x, q)
+        # The unconstrained likelihood is maximal, so the statistic is
+        # non-negative; a small negative remainder is rounding noise (e.g.
+        # when the breach rate equals the predicted tail probability).
+        lr_statistic = -2.0 * (constrained - unconstrained)
+        if lr_statistic < 0.0:
+            lr_statistic = 0.0
+        elif lr_statistic == 0.0:
+            # Emit a canonical +0.0 rather than a signed zero.
+            lr_statistic = 0.0
+        if not math.isfinite(lr_statistic):
+            raise InvalidInput(message="backtest computation overflowed")
+        p_value = math.erfc(math.sqrt(lr_statistic / 2.0))
+        if not math.isfinite(p_value):
+            raise InvalidInput(message="backtest computation overflowed")
+
+        return {
+            "currency": currency,
+            "confidence": confidence,
+            "significance": significance,
+            "observations": rows,
+            "observation_count": n,
+            "breach_count": x,
+            "breach_rate": breach_rate,
+            "kupiec": {
+                "lr_statistic": lr_statistic,
+                "p_value": p_value,
+                "accepted": p_value >= significance,
+            },
         }
 
     def _stress_test(self, payload: dict) -> dict:
