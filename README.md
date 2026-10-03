@@ -34,6 +34,27 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - VaR 取损失升序中 `ceil(confidence×n)-1` 位置；期望损失为最差 `k=max(1, ceil((1-confidence)×n))` 个观察的平均损失，损失并列时按输入顺序取尾部；`factor_expected_shortfall_contributions` 为尾部观察各因子平均损失，之和等于期望损失。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且不含部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（越界、数量或类型错误、NaN/Infinity）、`422 duplicate_position`、`422 duplicate_observation`、`422 missing_factor`、`413 request_too_large`（超过 10000 个观察）。观察中出现未被头寸引用的额外因子不影响结果。
 
+## 批量敏感度压力测试
+
+`POST /market-risk/stress-test` 把每个场景施加到整组头寸上：
+
+```json
+{
+  "currency": "USD",
+  "positions": [
+    {"id": "eq-book", "sensitivities": {"eq": 100.0, "ir": -50.0}}
+  ],
+  "scenarios": [
+    {"id": "crash", "factor_shocks": {"eq": -0.10, "ir": 0.02}}
+  ]
+}
+```
+
+- `currency` 为非空字符串，省略时取 `USD`。`positions` 与 `scenarios` 均为非空数组；头寸 `id`、场景 `id` 各自唯一且非空；`sensitivities` 与 `factor_shocks` 均为至少含一个风险因子的对象，值接受整数与有限浮点数、拒绝布尔值。额外字段忽略。
+- 头寸在某因子上的损失为敏感度乘冲击的相反数；场景 `loss` 为全部头寸损失之和。场景缺少的、已被头寸引用的因子按零冲击处理；场景中未被头寸引用的额外因子忽略。
+- 响应含 `currency`、按输入顺序排列的 `results` 与 `worst_scenario`。每个结果含场景 `scenario_id`、`loss`、按头寸 `id` 汇总的 `position_loss_contributions` 与按因子汇总的 `factor_loss_contributions`（零值项保留，两组归因均合计为 `loss`）。`worst_scenario` 返回最大 `loss` 的 `id` 与 `loss`，并列时取输入最早的场景；全部为负时不截断为零。任何计算出现非有限数值则整次失败、不返回部分结果。
+- 错误沿用 `{"error": {"code", "message"}}` 包装且不含部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型错误、空集合、NaN/Infinity 或计算溢出）、`422 duplicate_position`、`422 duplicate_scenario`、`413 request_too_large`（场景超过 1000 个，或场景数乘头寸数超过 100000，边界值允许）。
+
 ## 验证
 
 ```bash

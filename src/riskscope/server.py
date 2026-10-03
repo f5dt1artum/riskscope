@@ -36,7 +36,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def do_POST(self) -> None:
-        if self.path != "/market-risk/historical-var":
+        if self.path == "/market-risk/historical-var":
+            handler = self.service.historical_var
+        elif self.path == "/market-risk/stress-test":
+            handler = self.service.stress_test
+        else:
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
         try:
@@ -49,7 +53,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         raw = self.rfile.read(length) if length > 0 else b""
         try:
-            result = self.service.historical_var(raw)
+            result = handler(raw)
         except ServiceError as exc:
             self.send_json(
                 exc.status,
