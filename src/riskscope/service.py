@@ -1,7 +1,8 @@
 """Core service surface for RiskScope.
 
 The frozen baseline reports process health; historical-simulation VaR and
-expected shortfall now live behind :meth:`Service.historical_var`. The public
+expected shortfall now live behind :meth:`Service.historical_var` and batch
+sensitivity stress tests behind :meth:`Service.stress_test`. The public
 surface stays backward compatible.
 """
 
@@ -14,6 +15,8 @@ from decimal import Decimal, ROUND_CEILING
 from . import __version__
 
 MAX_OBSERVATIONS = 10000
+MAX_SCENARIOS = 1000
+MAX_SCENARIO_POSITION_PAIRS = 100000
 
 
 class ServiceError(Exception):
@@ -67,12 +70,61 @@ def _is_nonempty_str(value: object) -> bool:
     return isinstance(value, str) and len(value) > 0
 
 
+def _reconcile_totals(values: list[float], target: float) -> None:
+    """Nudge a factor bin so its ``sum`` equals the scenario ``target`` loss.
+
+    The two contribution partitions accumulate the same element losses in
+    different groupings, so their totals can differ by an ulp or two. The
+    position partition defines ``target``; here the factor partition is
+    aligned onto it with the smallest reachable correction. Only nonzero
+    entries move, so genuine zero contributions stay exactly zero. Where the
+    target is unreachable in float64 the residual is absorbed into the
+    largest bin, leaving a gap of at most a few ulps.
+    """
+    if sum(values) == target:
+        return
+    nonzero = [i for i, value in enumerate(values) if value != 0.0]
+    if not nonzero:
+        return
+    natural = sum(values)
+    target_step = math.ulp(abs(target)) if target != 0.0 else math.ulp(1.0)
+    largest = max(nonzero, key=lambda i: abs(values[i]))
+
+    def try_anchor(index: int) -> bool:
+        original = values[index]
+        values[index] = original + (target - natural)
+        if sum(values) == target:
+            return True
+        # Exhaustive ulp probes are cheap only while the bin count is small;
+        # real risk books reference at most a handful of factors.
+        if len(values) <= 64:
+            for step in {target_step, math.ulp(abs(original))}:
+                for distance in range(1, 9):
+                    values[index] = original + distance * step
+                    if sum(values) == target:
+                        return True
+                    values[index] = original - distance * step
+                    if sum(values) == target:
+                        return True
+        values[index] = original
+        return False
+
+    if try_anchor(largest) or try_anchor(nonzero[-1]):
+        return
+    # Unreachable in float64: absorb the residual into the largest bin, the
+    # best one-ulp approximation; every other entry stays untouched.
+    values[largest] = values[largest] + (target - sum(values))
+
+
 def _as_float(value: object) -> float:
     """Narrow a JSON number to a finite float or raise invalid_input.
 
     JSON integers have arbitrary precision, so a literal like 10**400 parses
-    fine but cannot be represented as a risk number.
+    fine but cannot be represented as a risk number. Booleans are rejected
+    even though ``bool`` is an ``int`` subclass.
     """
+    if isinstance(value, bool):
+        raise InvalidInput()
     try:
         result = float(value)  # type: ignore[arg-type]
     except (OverflowError, TypeError, ValueError):
@@ -99,6 +151,20 @@ class Service:
         well-formed JSON but semantically wrong raises :class:`InvalidInput`
         or :class:`RequestTooLarge`.
         """
+        return self._historical_var(self._load_object(raw))
+
+    def stress_test(self, raw: bytes | str) -> dict:
+        """Validate a batch sensitivity stress-test request and run it.
+
+        Each scenario shocks the whole position book: a position's loss on a
+        factor is ``-sensitivity * shock``. Missing referenced factors are
+        zero shocks; extra scenario factors are ignored. Parse failures and
+        non-object payloads raise :class:`InvalidRequest`; semantic problems
+        raise :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._stress_test(self._load_object(raw))
+
+    def _load_object(self, raw: bytes | str) -> dict:
         try:
             payload = json.loads(raw, parse_constant=_reject_constant)
         except _JsonConstant:
@@ -107,7 +173,7 @@ class Service:
             raise InvalidRequest("request body must be valid JSON")
         if not isinstance(payload, dict):
             raise InvalidRequest("request body must be a JSON object")
-        return self._historical_var(payload)
+        return payload
 
     def _historical_var(self, payload: dict) -> dict:
         currency = payload.get("currency", "USD")
@@ -234,4 +300,135 @@ class Service:
                 {"date": observations[i][0], "loss": losses[i]} for i in range(count)
             ],
             "factor_expected_shortfall_contributions": contributions,
+        }
+
+    def _stress_test(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not isinstance(currency, str) or len(currency) == 0:
+            raise InvalidInput()
+
+        positions_raw = payload.get("positions")
+        if not isinstance(positions_raw, list) or len(positions_raw) == 0:
+            raise InvalidInput()
+        positions: list[tuple[str, dict[str, float]]] = []
+        for position in positions_raw:
+            if not isinstance(position, dict):
+                raise InvalidInput()
+            position_id = position.get("id")
+            if not _is_nonempty_str(position_id):
+                raise InvalidInput()
+            sensitivities_raw = position.get("sensitivities")
+            if not isinstance(sensitivities_raw, dict) or len(sensitivities_raw) == 0:
+                raise InvalidInput()
+            # Narrow once so multiplication can never hit an oversized int.
+            sensitivities = {
+                factor: _as_float(value)
+                for factor, value in sensitivities_raw.items()
+            }
+            positions.append((position_id, sensitivities))
+
+        scenarios_raw = payload.get("scenarios")
+        if not isinstance(scenarios_raw, list) or len(scenarios_raw) == 0:
+            raise InvalidInput()
+        scenarios: list[tuple[str, dict[str, float]]] = []
+        for scenario in scenarios_raw:
+            if not isinstance(scenario, dict):
+                raise InvalidInput()
+            scenario_id = scenario.get("id")
+            if not _is_nonempty_str(scenario_id):
+                raise InvalidInput()
+            shocks_raw = scenario.get("factor_shocks")
+            if not isinstance(shocks_raw, dict) or len(shocks_raw) == 0:
+                raise InvalidInput()
+            shocks = {factor: _as_float(value) for factor, value in shocks_raw.items()}
+            scenarios.append((scenario_id, shocks))
+
+        if len(scenarios) > MAX_SCENARIOS:
+            raise RequestTooLarge(f"at most {MAX_SCENARIOS} scenarios are allowed")
+        if len(scenarios) * len(positions) > MAX_SCENARIO_POSITION_PAIRS:
+            raise RequestTooLarge(
+                f"scenarios times positions must not exceed {MAX_SCENARIO_POSITION_PAIRS}"
+            )
+
+        seen_position_ids: set[str] = set()
+        for position_id, _ in positions:
+            if position_id in seen_position_ids:
+                raise InvalidInput("duplicate_position", "position ids must be unique")
+            seen_position_ids.add(position_id)
+
+        seen_scenario_ids: set[str] = set()
+        for scenario_id, _ in scenarios:
+            if scenario_id in seen_scenario_ids:
+                raise InvalidInput("duplicate_scenario", "scenario ids must be unique")
+            seen_scenario_ids.add(scenario_id)
+
+        results: list[dict] = []
+        # Every position and every factor it references stays visible, with
+        # zero contributions when a scenario leaves it unshocked. The wire
+        # format sorts keys, so totals are folded in sorted-key order to keep
+        # ``sum(contributions.values()) == loss`` exact after JSON round-trip.
+        position_ids = [position_id for position_id, _ in positions]
+        sorted_position_ids = sorted(position_ids)
+        factor_order: list[str] = []
+        seen_factors: set[str] = set()
+        for _, sensitivities in positions:
+            for factor in sensitivities:
+                if factor not in seen_factors:
+                    seen_factors.add(factor)
+                    factor_order.append(factor)
+        sorted_factors = sorted(factor_order)
+        factor_index = {factor: i for i, factor in enumerate(sorted_factors)}
+
+        worst_index = 0
+        worst_loss = 0.0
+        have_worst = False
+        for scenario_index, (scenario_id, shocks) in enumerate(scenarios):
+            position_contributions = {position_id: 0.0 for position_id in position_ids}
+            factor_subtotals = [0.0 for _ in sorted_factors]
+            for position_id, sensitivities in positions:
+                subtotal = 0.0
+                for factor, sensitivity in sensitivities.items():
+                    # A referenced factor absent from the scenario is a zero
+                    # shock; factors only the scenario names are ignored.
+                    factor_loss = -sensitivity * shocks.get(factor, 0.0)
+                    if not math.isfinite(factor_loss):
+                        raise InvalidInput(message="stress computation overflowed")
+                    subtotal += factor_loss
+                    factor_subtotals[factor_index[factor]] += factor_loss
+                    if not math.isfinite(subtotal) or not math.isfinite(
+                        factor_subtotals[factor_index[factor]]
+                    ):
+                        raise InvalidInput(message="stress computation overflowed")
+                position_contributions[position_id] = subtotal
+
+            # Fold in the same sorted-key order the JSON body is delivered in.
+            total = sum(position_contributions[pid] for pid in sorted_position_ids)
+            if not math.isfinite(total) or not math.isfinite(sum(factor_subtotals)):
+                raise InvalidInput(message="stress computation overflowed")
+            _reconcile_totals(factor_subtotals, total)
+
+            results.append(
+                {
+                    "id": scenario_id,
+                    "loss": total,
+                    "position_loss_contributions": position_contributions,
+                    "factor_loss_contributions": {
+                        factor: factor_subtotals[factor_index[factor]]
+                        for factor in factor_order
+                    },
+                }
+            )
+            # Strictly greater keeps the earliest scenario on a tie.
+            if not have_worst or total > worst_loss:
+                have_worst = True
+                worst_loss = total
+                worst_index = scenario_index
+
+        return {
+            "currency": currency,
+            "results": results,
+            "worst_scenario": {
+                "id": scenarios[worst_index][0],
+                "loss": worst_loss,
+            },
         }
