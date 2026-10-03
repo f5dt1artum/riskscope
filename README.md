@@ -169,10 +169,35 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 响应回显 `currency`，并按期限顺序返回各桶的 `day`、`net_cashflow`、`cumulative_net_cashflow`、`available_liquidity`（截至该桶可用的折后资产累计）、`surplus`（累计净现金流加 `available_liquidity`）与 `required_funding`（`max(-surplus, 0)`，零值保留）。`earliest_shortfall` 为首个负 `surplus` 桶的 `day` 与 `required_funding`，无缺口时为 `null`。任何中间计算产生非有限数值时整次失败，不返回部分结果。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、类型或范围错误、桶序非法、现金流期限超过最终桶、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_cashflow`、`422 duplicate_asset`。
 
+## 跨账簿、多币种的头寸归并与折算
+
+`POST /portfolio-risk/aggregate` 把头寸的市值与敏感度按各自币种汇率折算到报告币，再按币种与账簿归并：
+
+```json
+{
+  "reporting_currency": "USD",
+  "fx_rates": {"EUR": 1.1, "JPY": 0.01},
+  "positions": [
+    {"id": "p1", "book": "book-a", "currency": "USD", "market_value": 100.0,
+     "sensitivities": {"eq": 10.0, "ir": -2.0}},
+    {"id": "p2", "book": "book-b", "currency": "EUR", "market_value": 50.0,
+     "sensitivities": {"eq": 5.0}},
+    {"id": "p3", "book": "book-a", "currency": "JPY", "market_value": -200.0,
+     "sensitivities": {"ir": 3.0, "fx": 7.0}}
+  ]
+}
+```
+
+- `reporting_currency` 为非空字符串，`fx_rates` 为对象，`positions` 为非空数组。每个头寸含唯一非空 `id`、非空 `book`、非空 `currency`、有限 `market_value` 与非空 `sensitivities` 对象，其中因子名非空、敏感度有限。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- `fx_rates` 表示一单位源币兑换的报告币金额：被引用的非报告币汇率必须为有限正数，缺失时整次失败；报告币隐含汇率为 1，显式提供时也只能为 1，否则整次失败；未被任何头寸引用的汇率（即使非法）一律忽略。
+- 每个头寸的 `market_value` 与各因子敏感度均乘以其币种汇率，负值保留。任何中间或汇总结果非有限时整次失败，不返回部分结果。
+- 响应回显 `reporting_currency` 并返回 `position_count`；`currencies` 与 `books` 均按头寸中首次出现的顺序排列。币种明细含 `currency`、`fx_rate`、`position_count`、`converted_market_value`、`converted_sensitivities`；账簿明细含 `book`、`position_count`、`converted_market_value`、`converted_sensitivities`。`portfolio_totals` 给出全组合折算市值与敏感度；各层汇总严格等于其所属明细之和。因子按头寸及各头寸对象内首次出现的顺序输出，未涉及因子补零、汇总为零仍保留。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且不含部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空字符串、结构或数值非法、报告币汇率不为 1、非有限计算结果）、`422 duplicate_position`（头寸 id 重复）、`422 missing_fx_rate`（被引用的非报告币缺少汇率）、`413 request_too_large`（头寸超过 10000 条、`fx_rates` 超过 1000 项，或敏感度条目总数超过 1000000；边界值允许处理）。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口与流动性缺口分析的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口、流动性缺口分析与跨账簿多币种头寸归并的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。

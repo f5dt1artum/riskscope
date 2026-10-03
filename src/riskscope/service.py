@@ -9,7 +9,9 @@ bucket lives behind :meth:`Service.liquidity_gap`. Sample covariance
 estimation from synchronized factor returns lives behind
 :meth:`Service.covariance_estimate`. Zero-mean Delta-Normal
 (parametric) VaR and expected shortfall live behind
-:meth:`Service.parametric_var`. The public surface stays
+:meth:`Service.parametric_var`. Cross-book, multi-currency position
+aggregation with FX conversion lives behind
+:meth:`Service.portfolio_aggregate`. The public surface stays
 backward compatible.
 """
 
@@ -31,6 +33,8 @@ MAX_FACTORS = 100
 MAX_FACTOR_OBSERVATION_PAIRS = 1000000
 MAX_POSITIONS = 10000
 MAX_FACTOR_POSITION_PAIRS = 1000000
+MAX_FX_RATES = 1000
+MAX_SENSITIVITY_ENTRIES = 1000000
 
 # Relative tolerance for covariance-matrix symmetry, positive
 # semidefiniteness, and the tiny negative variance that floating-point
@@ -283,6 +287,18 @@ class Service:
         raise :class:`InvalidInput`.
         """
         return self._liquidity_gap(self._load_object(raw))
+
+    def portfolio_aggregate(self, raw: bytes | str) -> dict:
+        """Validate a cross-book, multi-currency aggregation request and run it.
+
+        Every position's market value and sensitivities are converted into the
+        reporting currency with its currency's FX rate, then rolled up by
+        currency and by book. Parse failures and non-object payloads raise
+        :class:`InvalidRequest`; semantic problems raise :class:`InvalidInput`,
+        :class:`RequestTooLarge`, ``duplicate_position`` or
+        ``missing_fx_rate``.
+        """
+        return self._portfolio_aggregate(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -1337,4 +1353,242 @@ class Service:
             "currency": currency,
             "buckets": buckets,
             "earliest_shortfall": earliest_shortfall,
+        }
+
+    def _portfolio_aggregate(self, payload: dict) -> dict:
+        reporting_currency = payload.get("reporting_currency")
+        if not _is_nonempty_str(reporting_currency):
+            raise InvalidInput()
+
+        fx_rates_raw = payload.get("fx_rates")
+        if not isinstance(fx_rates_raw, dict):
+            raise InvalidInput()
+        if len(fx_rates_raw) > MAX_FX_RATES:
+            raise RequestTooLarge(f"at most {MAX_FX_RATES} fx rates are allowed")
+
+        positions_raw = payload.get("positions")
+        if not isinstance(positions_raw, list) or len(positions_raw) == 0:
+            raise InvalidInput()
+        if len(positions_raw) > MAX_POSITIONS:
+            raise RequestTooLarge(f"at most {MAX_POSITIONS} positions are allowed")
+
+        positions: list[dict] = []
+        sensitivity_entry_count = 0
+        for position in positions_raw:
+            if not isinstance(position, dict):
+                raise InvalidInput()
+            position_id = position.get("id")
+            if not _is_nonempty_str(position_id):
+                raise InvalidInput()
+            book = position.get("book")
+            if not _is_nonempty_str(book):
+                raise InvalidInput()
+            currency = position.get("currency")
+            if not _is_nonempty_str(currency):
+                raise InvalidInput()
+            market_value = _strict_float(position.get("market_value"))
+            sensitivities_raw = position.get("sensitivities")
+            if not isinstance(sensitivities_raw, dict) or len(sensitivities_raw) == 0:
+                raise InvalidInput()
+            sensitivities: dict[str, float] = {}
+            for factor, value in sensitivities_raw.items():
+                if not _is_nonempty_str(factor):
+                    raise InvalidInput()
+                sensitivities[factor] = _strict_float(value)
+            sensitivity_entry_count += len(sensitivities)
+            positions.append(
+                {
+                    "id": position_id,
+                    "book": book,
+                    "currency": currency,
+                    "market_value": market_value,
+                    "sensitivities": sensitivities,
+                }
+            )
+
+        if sensitivity_entry_count > MAX_SENSITIVITY_ENTRIES:
+            raise RequestTooLarge(
+                "sensitivity entries must not exceed "
+                f"{MAX_SENSITIVITY_ENTRIES}"
+            )
+
+        seen_position_ids: set[str] = set()
+        for position in positions:
+            if position["id"] in seen_position_ids:
+                raise InvalidInput("duplicate_position", "position ids must be unique")
+            seen_position_ids.add(position["id"])
+
+        # Resolve the FX rate of every referenced currency in first-appearance
+        # order. The reporting currency always converts at 1.0, including when
+        # an explicit rate is supplied (it must equal 1); rates for currencies
+        # no position references are never inspected.
+        used_rates: dict[str, float] = {}
+        for position in positions:
+            currency = position["currency"]
+            if currency in used_rates:
+                continue
+            if currency == reporting_currency:
+                rate = fx_rates_raw.get(currency, 1.0)
+                rate = _strict_float(rate)
+                if rate != 1.0:
+                    raise InvalidInput(
+                        message="reporting currency fx rate must be 1"
+                    )
+                used_rates[currency] = 1.0
+            else:
+                if currency not in fx_rates_raw:
+                    raise InvalidInput(
+                        "missing_fx_rate",
+                        f"missing fx rate for currency {currency!r}",
+                    )
+                rate = _strict_float(fx_rates_raw[currency])
+                if rate <= 0.0:
+                    raise InvalidInput()
+                used_rates[currency] = rate
+
+        # First-appearance orders: positions drive currencies, books and (with
+        # each object's own key order) factors.
+        currency_order: list[str] = []
+        book_order: list[str] = []
+        factor_order: list[str] = []
+        seen_currencies: set[str] = set()
+        seen_books: set[str] = set()
+        seen_factors: set[str] = set()
+
+        converted: list[dict] = []
+        for position in positions:
+            currency = position["currency"]
+            book = position["book"]
+            if currency not in seen_currencies:
+                seen_currencies.add(currency)
+                currency_order.append(currency)
+            if book not in seen_books:
+                seen_books.add(book)
+                book_order.append(book)
+            rate = used_rates[currency]
+            converted_mv = position["market_value"] * rate
+            if not math.isfinite(converted_mv):
+                raise InvalidInput(
+                    message="aggregation produced a non-finite result"
+                )
+            converted_sensitivities: dict[str, float] = {}
+            for factor, value in position["sensitivities"].items():
+                if factor not in seen_factors:
+                    seen_factors.add(factor)
+                    factor_order.append(factor)
+                converted_value = value * rate
+                if not math.isfinite(converted_value):
+                    raise InvalidInput(
+                        message="aggregation produced a non-finite result"
+                    )
+                converted_sensitivities[factor] = converted_value
+            converted.append(
+                {
+                    "currency": currency,
+                    "book": book,
+                    "market_value": converted_mv,
+                    "sensitivities": converted_sensitivities,
+                }
+            )
+
+        # Accumulate the portfolio totals as the sequential position sum (input
+        # order); the two partitions accumulate the same values grouped by
+        # currency and by book.
+        currency_acc = {
+            currency: {"market_value": 0.0, "sensitivities": {}}
+            for currency in currency_order
+        }
+        book_acc = {
+            book: {"market_value": 0.0, "sensitivities": {}} for book in book_order
+        }
+        total_market_value = 0.0
+        total_sensitivities: dict[str, float] = {}
+        for entry in converted:
+            total_market_value += entry["market_value"]
+            for factor, value in entry["sensitivities"].items():
+                total_sensitivities[factor] = total_sensitivities.get(factor, 0.0) + value
+            for bucket in (
+                currency_acc[entry["currency"]],
+                book_acc[entry["book"]],
+            ):
+                bucket["market_value"] += entry["market_value"]
+                for factor, value in entry["sensitivities"].items():
+                    bucket["sensitivities"][factor] = (
+                        bucket["sensitivities"].get(factor, 0.0) + value
+                    )
+
+        for value in [total_market_value, *total_sensitivities.values()]:
+            if not math.isfinite(value):
+                raise InvalidInput(
+                    message="aggregation produced a non-finite result"
+                )
+
+        def render_details(order: list[str], acc: dict, label: str) -> list[dict]:
+            details: list[dict] = []
+            market_values: list[float] = []
+            for key in order:
+                bucket = acc[key]
+                if not math.isfinite(bucket["market_value"]) or any(
+                    not math.isfinite(value)
+                    for value in bucket["sensitivities"].values()
+                ):
+                    raise InvalidInput(
+                        message="aggregation produced a non-finite result"
+                    )
+                sensitivities = {
+                    factor: bucket["sensitivities"].get(factor, 0.0)
+                    for factor in factor_order
+                }
+                detail = {
+                    label: key,
+                    "position_count": 0,
+                    "converted_market_value": bucket["market_value"],
+                    "converted_sensitivities": sensitivities,
+                }
+                details.append(detail)
+                market_values.append(bucket["market_value"])
+            # Fold the grouped sums onto the sequential portfolio total so
+            # each layer's totals equal the sum of its details exactly.
+            _reconcile_totals(market_values, total_market_value)
+            for index, key in enumerate(order):
+                details[index]["converted_market_value"] = market_values[index]
+            for factor in factor_order:
+                factor_values = [
+                    detail["converted_sensitivities"][factor] for detail in details
+                ]
+                _reconcile_totals(
+                    factor_values, total_sensitivities.get(factor, 0.0)
+                )
+                for index in range(len(details)):
+                    details[index]["converted_sensitivities"][factor] = (
+                        factor_values[index]
+                    )
+            return details
+
+        position_counts: dict[str, int] = {key: 0 for key in currency_order}
+        book_counts: dict[str, int] = {key: 0 for key in book_order}
+        for entry in converted:
+            position_counts[entry["currency"]] += 1
+            book_counts[entry["book"]] += 1
+
+        currency_details = render_details(currency_order, currency_acc, "currency")
+        book_details = render_details(book_order, book_acc, "book")
+        for detail, key in zip(currency_details, currency_order):
+            detail["position_count"] = position_counts[key]
+            detail["fx_rate"] = used_rates[key]
+        for detail, key in zip(book_details, book_order):
+            detail["position_count"] = book_counts[key]
+
+        return {
+            "reporting_currency": reporting_currency,
+            "position_count": len(positions),
+            "currencies": currency_details,
+            "books": book_details,
+            "portfolio_totals": {
+                "converted_market_value": total_market_value,
+                "converted_sensitivities": {
+                    factor: total_sensitivities.get(factor, 0.0)
+                    for factor in factor_order
+                },
+            },
         }
