@@ -34,6 +34,28 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - VaR 取损失升序中 `ceil(confidence×n)-1` 位置；期望损失为最差 `k=max(1, ceil((1-confidence)×n))` 个观察的平均损失，损失并列时按输入顺序取尾部；`factor_expected_shortfall_contributions` 为尾部观察各因子平均损失，之和等于期望损失。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且不含部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（越界、数量或类型错误、NaN/Infinity）、`422 duplicate_position`、`422 duplicate_observation`、`422 missing_factor`、`413 request_too_large`（超过 10000 个观察）。观察中出现未被头寸引用的额外因子不影响结果。
 
+## 参数法 VaR 与期望损失（Delta-Normal）
+
+`POST /market-risk/parametric-var` 以零均值 Delta-Normal 法按因子协方差矩阵计算组合 VaR：
+
+```json
+{
+  "confidence": 0.95,
+  "currency": "USD",
+  "factors": ["eq", "ir"],
+  "positions": [
+    {"id": "eq-book", "sensitivities": {"eq": 100.0, "ir": -50.0}}
+  ],
+  "covariance_matrix": [[0.01, 0.002], [0.002, 0.004]]
+}
+```
+
+- `currency` 为非空字符串，省略时取 `USD`；`confidence` 必须严格位于 (0, 1) 且有限。`factors` 为非空有序数组，名称须非空且唯一，其顺序同时决定敏感度向量与矩阵行列位置；`positions` 非空，每项含唯一非空 `id` 与 `sensitivities` 对象（允许空对象）。敏感度只能引用已声明因子，未声明因子返回 `unknown_factor`；头寸缺少某因子时该项敏感度按零处理。`covariance_matrix` 顺序与 `factors` 一致，须为 n×n 的有限数矩阵。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 各头寸敏感度按 `factors` 顺序汇总为向量 s，随后计算 `variance = sᵀΣs`、`volatility = sqrt(variance)`、`var = z × volatility`、`expected_shortfall = φ(z) × volatility / (1 - confidence)`，其中 z 为标准正态分位数、φ 为标准正态密度。
+- 矩阵须在 1e-12 相对容差内对称，且为半正定；不对称或非半正定返回 `invalid_covariance`。波动率为零时 `var` 与 `expected_shortfall` 均为 0.0；同一容差内的微小负 variance 按零处理，超出容差的负值或任何非有限计算结果均整次失败，不返回部分结果。
+- 响应回显 `currency`、`confidence`、`factors`，并含按 `factors` 顺序的 `aggregate_sensitivities` 及 `variance`、`volatility`、`var`、`expected_shortfall` 四项指标。
+- 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_covariance`（矩阵不对称或非半正定）、`422 duplicate_factor`、`422 duplicate_position`、`422 unknown_factor`（依次判定）、`422 invalid_input`（其他字段缺失、类型或范围错误、矩阵形状错误、NaN/Infinity、超大整数、非有限计算结果）、`413 request_too_large`（因子超过 100 个、头寸超过 10000 个，或因子数 × 头寸数超过 1000000；边界值允许处理）。
+
 ## 批量敏感度压力测试
 
 `POST /market-risk/stress-test` 把每个场景作用于整组头寸：
@@ -151,4 +173,4 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口与流动性缺口分析的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、参数法 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口与流动性缺口分析的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。

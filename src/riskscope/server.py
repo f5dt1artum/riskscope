@@ -38,6 +38,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path not in (
             "/market-risk/historical-var",
+            "/market-risk/parametric-var",
             "/market-risk/stress-test",
             "/market-risk/var-backtest",
             "/market-risk/covariance-estimate",
@@ -58,6 +59,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/market-risk/historical-var":
                 result = self.service.historical_var(raw)
+            elif self.path == "/market-risk/parametric-var":
+                result = self.service.parametric_var(raw)
             elif self.path == "/market-risk/var-backtest":
                 result = self.service.var_backtest(raw)
             elif self.path == "/market-risk/covariance-estimate":

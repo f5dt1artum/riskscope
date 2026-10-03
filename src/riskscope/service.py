@@ -7,7 +7,8 @@ credit exposure and expected loss live behind
 :meth:`Service.counterparty_exposure`. Liquidity gap analysis by maturity
 bucket lives behind :meth:`Service.liquidity_gap`. Sample covariance
 estimation from synchronized factor returns lives behind
-:meth:`Service.covariance_estimate`. The public surface stays
+:meth:`Service.covariance_estimate`. Zero-mean Delta-Normal parametric VaR
+lives behind :meth:`Service.parametric_var`. The public surface stays
 backward compatible.
 """
 
@@ -26,6 +27,12 @@ MAX_TRADES = 10000
 MAX_NETTING_SETS = 1000
 MAX_FACTORS = 100
 MAX_FACTOR_OBSERVATION_PAIRS = 1000000
+MAX_POSITIONS = 10000
+MAX_FACTOR_POSITION_PAIRS = 1000000
+
+# Relative tolerance for structural covariance checks: entries this close
+# are treated as symmetric, and a quadratic form this close to zero as zero.
+COVARIANCE_REL_TOL = 1e-12
 
 
 class ServiceError(Exception):
@@ -168,6 +175,103 @@ def _strict_int(value: object) -> int:
     return value
 
 
+def _strict_int(value: object) -> int:
+    """Narrow to a JSON integer, rejecting booleans and floats."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidInput()
+    return value
+
+
+# Acklam's rational approximation to the standard normal inverse CDF. It is
+# accurate to roughly 1e-9 across the whole (0, 1) range, plenty for a risk
+# metric, and relies only on :mod:`math` so no extra dependency is needed.
+# The tail numerator/denominator coefficients (c/d in the reference)...
+_NORM_TAIL_NUM = (
+    -7.784894002430293e-03,
+    -3.223964580411365e-01,
+    -2.400758277161838e00,
+    -2.549732539343734e00,
+    4.374664141464968e00,
+    2.938163982698783e00,
+)
+_NORM_TAIL_DEN = (
+    7.784695709041462e-03,
+    3.224671290700398e-01,
+    2.445134137142996e00,
+    3.754408661907416e00,
+)
+# ...and the central numerator/denominator coefficients (a/b).
+_NORM_CENTER_NUM = (
+    -3.969683028665376e01,
+    2.209460984245205e02,
+    -2.759285104469687e02,
+    1.383577518672690e02,
+    -3.066479806614716e01,
+    2.506628277459239e00,
+)
+_NORM_CENTER_DEN = (
+    -5.447609879822406e01,
+    1.615858368580409e02,
+    -1.556989798598866e02,
+    6.680131188771972e01,
+    -1.328068155288572e01,
+)
+
+
+def normal_quantile(p: float) -> float:
+    """Inverse standard-normal CDF for ``p`` strictly in (0, 1)."""
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+    if p < p_low:
+        q = math.sqrt(-2.0 * math.log(p))
+        numerator = (
+            ((((_NORM_TAIL_NUM[0] * q + _NORM_TAIL_NUM[1]) * q + _NORM_TAIL_NUM[2])
+              * q + _NORM_TAIL_NUM[3]) * q + _NORM_TAIL_NUM[4]) * q
+            + _NORM_TAIL_NUM[5]
+        )
+        denominator = (
+            (((_NORM_TAIL_DEN[0] * q + _NORM_TAIL_DEN[1]) * q + _NORM_TAIL_DEN[2])
+             * q + _NORM_TAIL_DEN[3]) * q + 1.0
+        )
+        x = numerator / denominator
+    elif p <= p_high:
+        q = p - 0.5
+        r = q * q
+        numerator = (
+            ((((_NORM_CENTER_NUM[0] * r + _NORM_CENTER_NUM[1]) * r
+               + _NORM_CENTER_NUM[2]) * r + _NORM_CENTER_NUM[3]) * r
+              + _NORM_CENTER_NUM[4]) * r + _NORM_CENTER_NUM[5]
+        ) * q
+        denominator = (
+            ((((_NORM_CENTER_DEN[0] * r + _NORM_CENTER_DEN[1]) * r
+               + _NORM_CENTER_DEN[2]) * r + _NORM_CENTER_DEN[3]) * r
+              + _NORM_CENTER_DEN[4]) * r + 1.0
+        )
+        x = numerator / denominator
+    else:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        numerator = (
+            ((((_NORM_TAIL_NUM[0] * q + _NORM_TAIL_NUM[1]) * q + _NORM_TAIL_NUM[2])
+              * q + _NORM_TAIL_NUM[3]) * q + _NORM_TAIL_NUM[4]) * q
+            + _NORM_TAIL_NUM[5]
+        )
+        denominator = (
+            (((_NORM_TAIL_DEN[0] * q + _NORM_TAIL_DEN[1]) * q + _NORM_TAIL_DEN[2])
+             * q + _NORM_TAIL_DEN[3]) * q + 1.0
+        )
+        x = -numerator / denominator
+    # One Halley step against the CDF (via erfc) takes the ~1e-9 rational
+    # approximation to machine precision.
+    error = 0.5 * math.erfc(-x / math.sqrt(2.0)) - p
+    correction = error * math.sqrt(2.0 * math.pi) * math.exp(0.5 * x * x)
+    return x - correction / (1.0 + 0.5 * x * correction)
+
+
+def normal_density(z: float) -> float:
+    """Standard-normal probability density at ``z``."""
+    return math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+
+
 class Service:
     """Risk engine service."""
 
@@ -225,6 +329,22 @@ class Service:
         :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._covariance_estimate(self._load_object(raw))
+
+    def parametric_var(self, raw: bytes | str) -> dict:
+        """Validate a parametric (zero-mean Delta-Normal) VaR request.
+
+        The request declares the risk ``factors`` (their order fixes the
+        sensitivity vector and the covariance axes), per-position
+        ``sensitivities`` (missing factors contribute zero), and a
+        ``covariance_matrix`` aligned with the factors. The aggregated
+        sensitivity vector ``s`` drives ``variance = sᵀΣs``,
+        ``volatility = sqrt(variance)``, ``var = z·volatility`` and
+        ``expected_shortfall = φ(z)·volatility/(1-confidence)`` for the
+        standard-normal quantile ``z`` and density ``φ``. Parse failures
+        and non-object payloads raise :class:`InvalidRequest`; semantic
+        problems raise :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._parametric_var(self._load_object(raw))
 
     def counterparty_exposure(self, raw: bytes | str) -> dict:
         """Validate a counterparty credit exposure request and compute it.
@@ -631,6 +751,208 @@ class Service:
             "volatilities": volatilities,
             "covariance_matrix": covariance,
             "correlation_matrix": correlation,
+        }
+
+    def _parametric_var(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not _is_nonempty_str(currency):
+            raise InvalidInput()
+
+        confidence = _strict_float(payload.get("confidence"))
+        if not 0 < confidence < 1:
+            raise InvalidInput()
+
+        factors_raw = payload.get("factors")
+        if not isinstance(factors_raw, list) or len(factors_raw) == 0:
+            raise InvalidInput()
+        if len(factors_raw) > MAX_FACTORS:
+            raise RequestTooLarge(f"at most {MAX_FACTORS} factors are allowed")
+        factors: list[str] = []
+        for factor in factors_raw:
+            if not _is_nonempty_str(factor):
+                raise InvalidInput()
+            factors.append(factor)
+        seen_factors: set[str] = set()
+        for factor in factors:
+            if factor in seen_factors:
+                raise InvalidInput("duplicate_factor", "factor names must be unique")
+            seen_factors.add(factor)
+
+        positions_raw = payload.get("positions")
+        if not isinstance(positions_raw, list) or len(positions_raw) == 0:
+            raise InvalidInput()
+        if len(positions_raw) > MAX_POSITIONS:
+            raise RequestTooLarge(f"at most {MAX_POSITIONS} positions are allowed")
+        if len(factors) * len(positions_raw) > MAX_FACTOR_POSITION_PAIRS:
+            raise RequestTooLarge(
+                "factors times positions must not exceed "
+                f"{MAX_FACTOR_POSITION_PAIRS}"
+            )
+        positions: list[tuple[str, dict[str, float]]] = []
+        for position in positions_raw:
+            if not isinstance(position, dict):
+                raise InvalidInput()
+            position_id = position.get("id")
+            if not _is_nonempty_str(position_id):
+                raise InvalidInput()
+            sensitivities_raw = position.get("sensitivities")
+            if not isinstance(sensitivities_raw, dict):
+                raise InvalidInput()
+            # An empty sensitivities object is allowed: the position simply
+            # contributes zero on every factor.
+            sensitivities = {
+                factor: _strict_float(value)
+                for factor, value in sensitivities_raw.items()
+            }
+            positions.append((position_id, sensitivities))
+
+        seen_position_ids: set[str] = set()
+        for position_id, _ in positions:
+            if position_id in seen_position_ids:
+                raise InvalidInput("duplicate_position", "position ids must be unique")
+            seen_position_ids.add(position_id)
+
+        n = len(factors)
+        covariance_raw = payload.get("covariance_matrix")
+        # Shape and element finiteness are ordinary input problems; only
+        # asymmetry and non-semidefiniteness earn the invalid_covariance code.
+        if not isinstance(covariance_raw, list) or len(covariance_raw) != n:
+            raise InvalidInput(
+                message="covariance_matrix must be an n x n matrix aligned with factors"
+            )
+        covariance: list[list[float]] = []
+        for row in covariance_raw:
+            if not isinstance(row, list) or len(row) != n:
+                raise InvalidInput(
+                    message="covariance_matrix must be an n x n matrix aligned with factors"
+                )
+            covariance.append([_strict_float(value) for value in row])
+
+        # Sensitivities may only reference declared factors; missing entries
+        # are aggregated as zero. This runs before the structural covariance
+        # checks so an unknown factor is reported even when the matrix is also
+        # bad, matching the documented error ordering.
+        aggregate = [0.0] * n
+        for _, sensitivities in positions:
+            for factor in sensitivities:
+                if factor not in seen_factors:
+                    raise InvalidInput(
+                        "unknown_factor",
+                        f"sensitivity references unknown factor {factor!r}",
+                    )
+        for _, sensitivities in positions:
+            for j, factor in enumerate(factors):
+                if factor in sensitivities:
+                    aggregate[j] += sensitivities[factor]
+        for value in aggregate:
+            if not math.isfinite(value):
+                raise InvalidInput(
+                    message="parametric VaR computation produced a non-finite result"
+                )
+
+        matrix_scale = 1.0
+        for row in covariance:
+            for value in row:
+                matrix_scale = max(matrix_scale, abs(value))
+        tolerance = COVARIANCE_REL_TOL * matrix_scale
+
+        # Symmetry within the relative tolerance. A matrix this close to
+        # symmetric is canonicalized onto its symmetric part so the same
+        # tolerance governs the semidefiniteness check and every later dot
+        # product.
+        sym = [row[:] for row in covariance]
+        for i in range(n):
+            for j in range(i + 1, n):
+                upper = covariance[i][j]
+                lower = covariance[j][i]
+                if abs(upper - lower) > tolerance:
+                    raise InvalidInput(
+                        "invalid_covariance",
+                        "covariance_matrix must be symmetric",
+                    )
+                averaged = 0.5 * (upper + lower)
+                sym[i][j] = averaged
+                sym[j][i] = averaged
+
+        # Positive semidefiniteness through LDLᵀ without pivoting. A pivot
+        # within the tolerance of zero is accepted only when its whole cross
+        # row is also within tolerance; the factor is then constant on the
+        # preceding space, so the pivot is skipped and the untouched block
+        # (the exact Schur complement when the cross row is zero) is tested
+        # next. This keeps diag(0, 1) valid while rejecting [[0,1],[1,0]].
+        schur = [row[:] for row in sym]
+        for k in range(n):
+            pivot = schur[k][k]
+            if pivot < -tolerance:
+                raise InvalidInput(
+                    "invalid_covariance",
+                    "covariance_matrix must be positive semidefinite",
+                )
+            if pivot <= tolerance:
+                for i in range(k + 1, n):
+                    if abs(schur[i][k]) > tolerance:
+                        raise InvalidInput(
+                            "invalid_covariance",
+                            "covariance_matrix must be positive semidefinite",
+                        )
+                continue
+            for i in range(k + 1, n):
+                factor_ratio = schur[i][k] / pivot
+                for j in range(k + 1, n):
+                    schur[i][j] -= factor_ratio * schur[k][j]
+
+        # variance = sᵀΣs, summed from the symmetric part. The absolute sum
+        # bounds the magnitude any rounding slip could reach, so a negative
+        # result inside the same relative tolerance is numerical noise.
+        variance = 0.0
+        absolute_scale = 0.0
+        for i in range(n):
+            diagonal_term = aggregate[i] * aggregate[i] * sym[i][i]
+            variance += diagonal_term
+            absolute_scale += abs(diagonal_term)
+            for j in range(i + 1, n):
+                cross_term = 2.0 * aggregate[i] * aggregate[j] * sym[i][j]
+                variance += cross_term
+                absolute_scale += abs(cross_term)
+        if not math.isfinite(variance):
+            raise InvalidInput(
+                message="parametric VaR computation produced a non-finite result"
+            )
+        if variance < 0.0:
+            if variance >= -COVARIANCE_REL_TOL * max(1.0, absolute_scale):
+                variance = 0.0
+            else:
+                raise InvalidInput(
+                    "invalid_covariance",
+                    "covariance_matrix must be positive semidefinite",
+                )
+
+        volatility = math.sqrt(variance)
+        if volatility == 0.0:
+            # A degenerate book has no loss distribution: both tail metrics
+            # are exactly zero regardless of the confidence level.
+            var = 0.0
+            expected_shortfall = 0.0
+        else:
+            z = normal_quantile(confidence)
+            density = normal_density(z)
+            var = z * volatility
+            expected_shortfall = density * volatility / (1.0 - confidence)
+            for value in (z, density, var, expected_shortfall):
+                if not math.isfinite(value):
+                    raise InvalidInput(
+                        message="parametric VaR computation produced a non-finite result"
+                    )
+
+        return {
+            "currency": currency,
+            "confidence": confidence,
+            "factors": factors,
+            "aggregate_sensitivities": aggregate,
+            "variance": variance,
+            "volatility": volatility,
+            "var": var,
+            "expected_shortfall": expected_shortfall,
         }
 
     def _stress_test(self, payload: dict) -> dict:
