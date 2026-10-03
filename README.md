@@ -194,10 +194,35 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 响应回显 `reporting_currency` 并返回 `position_count`；`currencies` 与 `books` 均按头寸中首次出现的顺序排列。币种明细含 `currency`、`fx_rate`、`position_count`、`converted_market_value`、`converted_sensitivities`；账簿明细含 `book`、`position_count`、`converted_market_value`、`converted_sensitivities`。`portfolio_totals` 给出全组合折算市值与敏感度；各层汇总严格等于其所属明细之和。因子按头寸及各头寸对象内首次出现的顺序输出，未涉及因子补零、汇总为零仍保留。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且不含部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空字符串、结构或数值非法、报告币汇率不为 1、非有限计算结果）、`422 duplicate_position`（头寸 id 重复）、`422 missing_fx_rate`（被引用的非报告币缺少汇率）、`413 request_too_large`（头寸超过 10000 条、`fx_rates` 超过 1000 项，或敏感度条目总数超过 1000000；边界值允许处理）。
 
+## 风险限额评估
+
+`POST /risk-management/limit-check` 把调用方算好的指标观测与声明的限额逐项比对，返回各项状态、告警与整体结论；本功能不调用既有计算、不换汇、不保存历史：
+
+```json
+{
+  "as_of": "2024-06-30",
+  "limits": [
+    {"id": "lim-var", "scope": {"type": "book", "id": "book-a"},
+     "metric": "var", "unit": "USD", "limit": 100.0},
+    {"id": "lim-es", "scope": {"type": "book", "id": "book-b"},
+     "metric": "expected_shortfall", "unit": "USD", "limit": 50.0,
+     "warning_ratio": 0.5}
+  ],
+  "measurements": [
+    {"limit_id": "lim-var", "value": 120.0}
+  ]
+}
+```
+
+- `as_of` 为非空字符串；`limits` 为非空数组，每条限额含唯一非空 `id`、由非空 `type` 与 `id` 组成的 `scope`、非空 `metric` 与 `unit`、严格大于零的有限 `limit`；`warning_ratio` 省略时为 0.8，否则须为大于零且小于 1 的有限数。`measurements` 可省略或为空数组，每条观测以 `limit_id` 引用已声明限额并提供非负有限 `value`，同一限额至多一条。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 响应回显 `as_of`，`limits` 按输入顺序返回原定义及评估值。有观测时 `utilization = value / limit`、`headroom = limit - value`；`value >= limit` 为 `breach`，未突破但 `value >= limit × warning_ratio` 为 `warning`，否则为 `ok`。无观测时 `value`、`utilization`、`headroom` 为 `null`，状态为 `no_data`。
+- `alerts` 仅含 `warning` 与 `breach` 的限额评估项且保持限额顺序；`summary` 统计 `ok`、`warning`、`breach`、`no_data` 四种状态的数量；`overall_status` 按 `breach`、`warning`、`incomplete`、`ok` 的优先级确定，其中 `incomplete` 表示没有更高状态但存在 `no_data`。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且不含部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、结构或类型错误、范围或数值有限性非法）、`422 duplicate_limit`（限额 id 重复）、`422 duplicate_measurement`（同一限额观测重复）、`422 unknown_limit`（观测引用未声明限额）、`413 request_too_large`（`limits` 或 `measurements` 超过 10000 条；边界值允许处理）。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口、流动性缺口分析与跨账簿多币种头寸归并的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口、流动性缺口分析、跨账簿多币种头寸归并与风险限额评估的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。

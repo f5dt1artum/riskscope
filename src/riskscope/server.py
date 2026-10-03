@@ -45,6 +45,7 @@ class Handler(BaseHTTPRequestHandler):
             "/credit-risk/counterparty-exposure",
             "/liquidity-risk/liquidity-gap",
             "/portfolio-risk/aggregate",
+            "/risk-management/limit-check",
         ):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
@@ -72,6 +73,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.liquidity_gap(raw)
             elif self.path == "/portfolio-risk/aggregate":
                 result = self.service.portfolio_aggregate(raw)
+            elif self.path == "/risk-management/limit-check":
+                result = self.service.limit_check(raw)
             else:
                 result = self.service.stress_test(raw)
         except ServiceError as exc:
