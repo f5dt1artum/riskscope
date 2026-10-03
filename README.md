@@ -103,10 +103,33 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 响应回显 `currency`，按输入顺序返回 `netting_sets` 明细（含 `trade_count`，无交易的已声明结算集保留零值），按交易对手输入顺序返回 `counterparties` 汇总金额，并返回 `portfolio_totals`；各层总计等于对应明细之和。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、类型或范围错误、引用不存在、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_counterparty`、`422 duplicate_netting_set`、`422 duplicate_trade`、`413 request_too_large`（交易超过 10000 条或结算集超过 1000 个；边界值允许处理）。
 
+## 流动性缺口与变现折扣
+
+`POST /liquidity-risk/liquidity-gap` 按期限桶衡量资金缺口与变现折扣：
+
+```json
+{
+  "currency": "USD",
+  "buckets": [7, 30, 90],
+  "cashflows": [
+    {"id": "cf-1", "day": 5, "amount": 100.0},
+    {"id": "cf-2", "day": 10, "amount": -250.0}
+  ],
+  "liquid_assets": [
+    {"id": "la-1", "market_value": 200.0, "haircut": 0.1, "available_day": 0}
+  ]
+}
+```
+
+- `currency` 省略时取 `USD`，否则须为非空字符串；`buckets` 为非空、严格递增且不重复的正整数天数数组；`cashflows` 为非空数组，每项含唯一非空 `id`、正整数 `day` 与有限 `amount`（正数为流入、负数为流出）；`liquid_assets` 省略时为空数组，每项含唯一非空 `id`、非负有限 `market_value`、位于 [0, 1] 的 `haircut` 与非负整数 `available_day`。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 现金流归入首个不小于 `day` 的桶，`day` 超过最终期限则整次失败；资产从首个不小于 `available_day` 的桶起可用（超过最终期限则始终不可用），折后金额为 `market_value × (1 - haircut)`。
+- 响应回显 `currency`，并按期限顺序返回各桶的 `day`、`net_cashflow`、`cumulative_net_cashflow`、`available_liquidity`（截至该桶可用的折后资产累计）、`surplus`（累计净现金流加 `available_liquidity`）与 `required_funding`（`max(-surplus, 0)`，零值保留）。`earliest_shortfall` 为首个负 `surplus` 桶的 `day` 与 `required_funding`，无缺口时为 `null`。任何中间计算产生非有限数值时整次失败，不返回部分结果。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、类型或范围错误、桶序非法、现金流期限超过最终桶、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_cashflow`、`422 duplicate_asset`。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验与交易对手信用敞口的行为均已冻结，后续能力（如流动性风险等）须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、交易对手信用敞口与流动性缺口分析的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
