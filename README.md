@@ -78,10 +78,35 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 令 n 为观察数、x 为突破数、`p = 1 - confidence`，按规格公式计算 `kupiec.lr_statistic`（`0·ln0` 按 0 计算，舍入导致的微小负值按 0 处理），`kupiec.p_value = erfc(sqrt(lr_statistic/2))`；`kupiec.accepted` 仅在 `p_value >= significance` 时为 `true`。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_observation`（date 重复）、`413 request_too_large`（超过 10000 条观察；边界值允许处理）。
 
+## 交易对手信用敞口与预期信用损失
+
+`POST /credit-risk/counterparty-exposure` 按净额结算集汇总交易敞口并计算预期损失：
+
+```json
+{
+  "currency": "USD",
+  "counterparties": [
+    {"id": "cp-a", "pd": 0.02, "lgd": 0.5}
+  ],
+  "netting_sets": [
+    {"id": "ns-1", "counterparty_id": "cp-a", "collateral": 10.0}
+  ],
+  "trades": [
+    {"id": "t-1", "netting_set_id": "ns-1", "mtm": 100.0, "add_on": 5.0},
+    {"id": "t-2", "netting_set_id": "ns-1", "mtm": -30.0, "add_on": 2.5}
+  ]
+}
+```
+
+- `currency` 为非空字符串，省略时取 `USD`；`counterparties`、`netting_sets`、`trades` 均为非空数组。交易对手 `id` 非空且 `pd`、`lgd` 位于 [0, 1]；结算集 `id` 非空、`counterparty_id` 必须引用已声明交易对手、`collateral` 非负；交易 `id` 非空、`netting_set_id` 必须引用已声明结算集、`mtm` 有限、`add_on` 非负有限。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 每个结算集：`gross_exposure` 为所属交易 `max(mtm, 0)` 之和，`net_mtm` 为 `mtm` 之和，`potential_future_exposure` 为 `add_on` 之和，`exposure_at_default = max(net_mtm + potential_future_exposure - collateral, 0)`（超额抵押不产生负敞口），`expected_loss = exposure_at_default × pd × lgd`（取所属交易对手的 `pd`、`lgd`）。
+- 响应回显 `currency`，按输入顺序返回 `netting_sets` 明细（含 `trade_count`，无交易的已声明结算集保留零值），按交易对手输入顺序返回 `counterparties` 汇总金额，并返回 `portfolio_totals`；各层总计等于对应明细之和。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、类型或范围错误、引用不存在、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_counterparty`、`422 duplicate_netting_set`、`422 duplicate_trade`、`413 request_too_large`（交易超过 10000 条或结算集超过 1000 个；边界值允许处理）。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试与 VaR 回溯检验的行为均已冻结，后续能力（如信用敞口等）须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验与交易对手信用敞口的行为均已冻结，后续能力（如流动性风险等）须从这些已冻结事实出发独立设计并验证。

@@ -2,8 +2,10 @@
 
 The frozen baseline reports process health; historical-simulation VaR and
 expected shortfall now live behind :meth:`Service.historical_var` and batch
-sensitivity stress tests behind :meth:`Service.stress_test`. The public
-surface stays backward compatible.
+sensitivity stress tests behind :meth:`Service.stress_test`. Counterparty
+credit exposure and expected loss live behind
+:meth:`Service.counterparty_exposure`. The public surface stays backward
+compatible.
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ from . import __version__
 MAX_OBSERVATIONS = 10000
 MAX_SCENARIOS = 1000
 MAX_SCENARIO_POSITION_PAIRS = 100000
+MAX_TRADES = 10000
+MAX_NETTING_SETS = 1000
 
 
 class ServiceError(Exception):
@@ -194,6 +198,20 @@ class Service:
         :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._var_backtest(self._load_object(raw))
+
+    def counterparty_exposure(self, raw: bytes | str) -> dict:
+        """Validate a counterparty credit exposure request and compute it.
+
+        Trades roll up into their netting set: ``gross_exposure`` sums the
+        positive mark-to-markets, ``net_mtm`` sums all mark-to-markets, and
+        ``potential_future_exposure`` sums the add-ons. ``exposure_at_default``
+        floors the collateral-adjusted net exposure at zero, and
+        ``expected_loss`` is ``exposure_at_default * pd * lgd`` for the
+        netting set's counterparty. Parse failures and non-object payloads
+        raise :class:`InvalidRequest`; semantic problems raise
+        :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._counterparty_exposure(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -568,4 +586,202 @@ class Service:
                 "id": scenarios[worst_index][0],
                 "loss": worst_loss,
             },
+        }
+
+    def _counterparty_exposure(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not _is_nonempty_str(currency):
+            raise InvalidInput()
+
+        counterparties_raw = payload.get("counterparties")
+        if not isinstance(counterparties_raw, list) or len(counterparties_raw) == 0:
+            raise InvalidInput()
+        counterparties: list[dict] = []
+        for counterparty in counterparties_raw:
+            if not isinstance(counterparty, dict):
+                raise InvalidInput()
+            counterparty_id = counterparty.get("id")
+            if not _is_nonempty_str(counterparty_id):
+                raise InvalidInput()
+            pd = _strict_float(counterparty.get("pd"))
+            lgd = _strict_float(counterparty.get("lgd"))
+            if not 0.0 <= pd <= 1.0 or not 0.0 <= lgd <= 1.0:
+                raise InvalidInput()
+            counterparties.append({"id": counterparty_id, "pd": pd, "lgd": lgd})
+
+        netting_sets_raw = payload.get("netting_sets")
+        if not isinstance(netting_sets_raw, list) or len(netting_sets_raw) == 0:
+            raise InvalidInput()
+        if len(netting_sets_raw) > MAX_NETTING_SETS:
+            raise RequestTooLarge(f"at most {MAX_NETTING_SETS} netting sets are allowed")
+        netting_sets: list[dict] = []
+        for netting_set in netting_sets_raw:
+            if not isinstance(netting_set, dict):
+                raise InvalidInput()
+            netting_set_id = netting_set.get("id")
+            if not _is_nonempty_str(netting_set_id):
+                raise InvalidInput()
+            counterparty_id = netting_set.get("counterparty_id")
+            if not _is_nonempty_str(counterparty_id):
+                raise InvalidInput()
+            collateral = _strict_float(netting_set.get("collateral"))
+            if collateral < 0.0:
+                raise InvalidInput()
+            netting_sets.append(
+                {
+                    "id": netting_set_id,
+                    "counterparty_id": counterparty_id,
+                    "collateral": collateral,
+                }
+            )
+
+        trades_raw = payload.get("trades")
+        if not isinstance(trades_raw, list) or len(trades_raw) == 0:
+            raise InvalidInput()
+        if len(trades_raw) > MAX_TRADES:
+            raise RequestTooLarge(f"at most {MAX_TRADES} trades are allowed")
+        trades: list[dict] = []
+        for trade in trades_raw:
+            if not isinstance(trade, dict):
+                raise InvalidInput()
+            trade_id = trade.get("id")
+            if not _is_nonempty_str(trade_id):
+                raise InvalidInput()
+            netting_set_id = trade.get("netting_set_id")
+            if not _is_nonempty_str(netting_set_id):
+                raise InvalidInput()
+            mtm = _strict_float(trade.get("mtm"))
+            add_on = _strict_float(trade.get("add_on"))
+            if add_on < 0.0:
+                raise InvalidInput()
+            trades.append(
+                {
+                    "id": trade_id,
+                    "netting_set_id": netting_set_id,
+                    "mtm": mtm,
+                    "add_on": add_on,
+                }
+            )
+
+        seen_counterparty_ids: set[str] = set()
+        for counterparty in counterparties:
+            if counterparty["id"] in seen_counterparty_ids:
+                raise InvalidInput(
+                    "duplicate_counterparty", "counterparty ids must be unique"
+                )
+            seen_counterparty_ids.add(counterparty["id"])
+
+        seen_netting_set_ids: set[str] = set()
+        for netting_set in netting_sets:
+            if netting_set["id"] in seen_netting_set_ids:
+                raise InvalidInput(
+                    "duplicate_netting_set", "netting set ids must be unique"
+                )
+            seen_netting_set_ids.add(netting_set["id"])
+
+        seen_trade_ids: set[str] = set()
+        for trade in trades:
+            if trade["id"] in seen_trade_ids:
+                raise InvalidInput("duplicate_trade", "trade ids must be unique")
+            seen_trade_ids.add(trade["id"])
+
+        counterparty_by_id = {cp["id"]: cp for cp in counterparties}
+        for netting_set in netting_sets:
+            if netting_set["counterparty_id"] not in counterparty_by_id:
+                raise InvalidInput(
+                    message="netting set references an unknown counterparty"
+                )
+        netting_set_ids = {ns["id"] for ns in netting_sets}
+        for trade in trades:
+            if trade["netting_set_id"] not in netting_set_ids:
+                raise InvalidInput(message="trade references an unknown netting set")
+
+        amount_keys = (
+            "gross_exposure",
+            "net_mtm",
+            "potential_future_exposure",
+            "collateral",
+            "exposure_at_default",
+            "expected_loss",
+        )
+
+        netting_set_metrics: list[dict] = []
+        for netting_set in netting_sets:
+            gross_exposure = 0.0
+            net_mtm = 0.0
+            potential_future_exposure = 0.0
+            trade_count = 0
+            for trade in trades:
+                if trade["netting_set_id"] != netting_set["id"]:
+                    continue
+                trade_count += 1
+                gross_exposure += max(trade["mtm"], 0.0)
+                net_mtm += trade["mtm"]
+                potential_future_exposure += trade["add_on"]
+            # Over-collateralization floors the exposure at zero; it never
+            # turns negative.
+            exposure_at_default = max(
+                net_mtm + potential_future_exposure - netting_set["collateral"], 0.0
+            )
+            counterparty = counterparty_by_id[netting_set["counterparty_id"]]
+            expected_loss = (
+                exposure_at_default * counterparty["pd"] * counterparty["lgd"]
+            )
+            for value in (
+                gross_exposure,
+                net_mtm,
+                potential_future_exposure,
+                exposure_at_default,
+                expected_loss,
+            ):
+                if not math.isfinite(value):
+                    raise InvalidInput(
+                        message="exposure computation produced a non-finite result"
+                    )
+            netting_set_metrics.append(
+                {
+                    "id": netting_set["id"],
+                    "counterparty_id": netting_set["counterparty_id"],
+                    "trade_count": trade_count,
+                    "gross_exposure": gross_exposure,
+                    "net_mtm": net_mtm,
+                    "potential_future_exposure": potential_future_exposure,
+                    "collateral": netting_set["collateral"],
+                    "exposure_at_default": exposure_at_default,
+                    "expected_loss": expected_loss,
+                }
+            )
+
+        # Aggregate in input order at both levels so the portfolio totals are
+        # exactly the sequential sum of the counterparty details.
+        counterparty_metrics: list[dict] = []
+        for counterparty in counterparties:
+            totals = {key: 0.0 for key in amount_keys}
+            for metrics in netting_set_metrics:
+                if metrics["counterparty_id"] != counterparty["id"]:
+                    continue
+                for key in amount_keys:
+                    totals[key] += metrics[key]
+            for value in totals.values():
+                if not math.isfinite(value):
+                    raise InvalidInput(
+                        message="exposure computation produced a non-finite result"
+                    )
+            counterparty_metrics.append({"id": counterparty["id"], **totals})
+
+        portfolio_totals = {key: 0.0 for key in amount_keys}
+        for metrics in counterparty_metrics:
+            for key in amount_keys:
+                portfolio_totals[key] += metrics[key]
+        for value in portfolio_totals.values():
+            if not math.isfinite(value):
+                raise InvalidInput(
+                    message="exposure computation produced a non-finite result"
+                )
+
+        return {
+            "currency": currency,
+            "netting_sets": netting_set_metrics,
+            "counterparties": counterparty_metrics,
+            "portfolio_totals": portfolio_totals,
         }
