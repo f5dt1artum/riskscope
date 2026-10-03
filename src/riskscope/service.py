@@ -5,8 +5,10 @@ expected shortfall now live behind :meth:`Service.historical_var` and batch
 sensitivity stress tests behind :meth:`Service.stress_test`. Counterparty
 credit exposure and expected loss live behind
 :meth:`Service.counterparty_exposure`. Liquidity gap analysis by maturity
-bucket lives behind :meth:`Service.liquidity_gap`. The public surface stays
-backward compatible.
+bucket lives behind :meth:`Service.liquidity_gap`. Sample means, covariance,
+volatilities and correlations for synchronous factor returns live behind
+:meth:`Service.covariance_estimate`. The public surface stays backward
+compatible.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ MAX_SCENARIOS = 1000
 MAX_SCENARIO_POSITION_PAIRS = 100000
 MAX_TRADES = 10000
 MAX_NETTING_SETS = 1000
+MAX_FACTORS = 100
+MAX_FACTOR_OBSERVATION_PAIRS = 1000000
 
 
 class ServiceError(Exception):
@@ -235,6 +239,19 @@ class Service:
         raise :class:`InvalidInput`.
         """
         return self._liquidity_gap(self._load_object(raw))
+
+    def covariance_estimate(self, raw: bytes | str) -> dict:
+        """Validate a covariance-estimation request and compute statistics.
+
+        Synchronous factor-return observations feed sample means, an
+        unbiased (divide by ``n - 1``) covariance matrix, per-factor
+        volatilities, and a correlation matrix. Observation order is kept
+        as given; undeclared factors and extra fields are ignored. Parse
+        failures and non-object payloads raise :class:`InvalidRequest`;
+        semantic problems raise :class:`InvalidInput` or
+        :class:`RequestTooLarge`.
+        """
+        return self._covariance_estimate(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -961,4 +978,142 @@ class Service:
             "currency": currency,
             "buckets": buckets,
             "earliest_shortfall": earliest_shortfall,
+        }
+
+    def _covariance_estimate(self, payload: dict) -> dict:
+        factors_raw = payload.get("factors")
+        if not isinstance(factors_raw, list) or len(factors_raw) == 0:
+            raise InvalidInput()
+        factors: list[str] = []
+        for factor in factors_raw:
+            if not _is_nonempty_str(factor):
+                raise InvalidInput()
+            factors.append(factor)
+
+        observations_raw = payload.get("observations")
+        if not isinstance(observations_raw, list) or len(observations_raw) == 0:
+            raise InvalidInput()
+
+        if len(factors) > MAX_FACTORS:
+            raise RequestTooLarge(f"at most {MAX_FACTORS} factors are allowed")
+        if len(observations_raw) > MAX_OBSERVATIONS:
+            raise RequestTooLarge(f"at most {MAX_OBSERVATIONS} observations are allowed")
+        if len(factors) * len(observations_raw) > MAX_FACTOR_OBSERVATION_PAIRS:
+            raise RequestTooLarge(
+                f"factors times observations must not exceed "
+                f"{MAX_FACTOR_OBSERVATION_PAIRS}"
+            )
+
+        seen_factors: set[str] = set()
+        for factor in factors:
+            if factor in seen_factors:
+                raise InvalidInput("duplicate_factor", "factor names must be unique")
+            seen_factors.add(factor)
+
+        n = len(observations_raw)
+        rows: list[list[float]] = []
+        seen_dates: set[str] = set()
+        for observation in observations_raw:
+            if not isinstance(observation, dict):
+                raise InvalidInput()
+            date = observation.get("date")
+            if not _is_nonempty_str(date):
+                raise InvalidInput()
+            factor_returns = observation.get("factor_returns")
+            if not isinstance(factor_returns, dict):
+                raise InvalidInput()
+            row: list[float] = []
+            for factor in factors:
+                if factor not in factor_returns:
+                    raise InvalidInput(
+                        "missing_factor",
+                        f"observation {date!r} lacks factor {factor!r}",
+                    )
+                # Integers and finite floats pass; booleans, NaN, Infinity
+                # and oversized integers do not.
+                row.append(_strict_float(factor_returns[factor]))
+            if date in seen_dates:
+                raise InvalidInput(
+                    "duplicate_observation", "observation dates must be unique"
+                )
+            seen_dates.add(date)
+            rows.append(row)
+
+        if n < 2:
+            raise InvalidInput()
+
+        k = len(factors)
+
+        # Arithmetic means in factor-input order.
+        means = [0.0] * k
+        for row in rows:
+            for j in range(k):
+                means[j] += row[j]
+        means = [total / n for total in means]
+        for value in means:
+            if not math.isfinite(value):
+                raise InvalidInput(
+                    message="covariance computation produced a non-finite result"
+                )
+
+        # Observations stay in input order; nothing sorts by date.
+        centered = [[row[j] - means[j] for j in range(k)] for row in rows]
+
+        # Unbiased sample covariance: sum of demeaned products / (n - 1).
+        # The upper triangle is computed once and mirrored, so the matrix is
+        # symmetric down to the last bit.
+        covariance = [[0.0] * k for _ in range(k)]
+        for i in range(k):
+            for j in range(i, k):
+                total = 0.0
+                for row in centered:
+                    total += row[i] * row[j]
+                    if not math.isfinite(total):
+                        raise InvalidInput(
+                            message="covariance computation produced a non-finite result"
+                        )
+                value = total / (n - 1)
+                if not math.isfinite(value):
+                    raise InvalidInput(
+                        message="covariance computation produced a non-finite result"
+                    )
+                covariance[i][j] = value
+                covariance[j][i] = value
+
+        volatilities: list[float] = []
+        for i in range(k):
+            # A diagonal entry can only go slightly negative through
+            # cancellation; the volatility is the non-negative root either
+            # way and stays finite.
+            vol = math.sqrt(max(covariance[i][i], 0.0))
+            if not math.isfinite(vol):
+                raise InvalidInput(
+                    message="covariance computation produced a non-finite result"
+                )
+            volatilities.append(vol)
+
+        correlation = [[0.0] * k for _ in range(k)]
+        for i in range(k):
+            correlation[i][i] = 1.0
+            for j in range(i + 1, k):
+                if volatilities[i] == 0.0 or volatilities[j] == 0.0:
+                    corr = 0.0
+                else:
+                    corr = covariance[i][j] / (
+                        volatilities[i] * volatilities[j]
+                    )
+                    if not math.isfinite(corr):
+                        raise InvalidInput(
+                            message="covariance computation produced a non-finite result"
+                        )
+                correlation[i][j] = corr
+                correlation[j][i] = corr
+
+        return {
+            "factors": factors,
+            "observation_count": n,
+            "means": means,
+            "volatilities": volatilities,
+            "covariance_matrix": covariance,
+            "correlation_matrix": correlation,
         }
