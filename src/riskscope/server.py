@@ -36,7 +36,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def do_POST(self) -> None:
-        if self.path not in ("/market-risk/historical-var", "/market-risk/stress-test"):
+        if self.path not in (
+            "/market-risk/historical-var",
+            "/market-risk/stress-test",
+            "/market-risk/var-backtest",
+        ):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
         try:
@@ -51,6 +55,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/market-risk/historical-var":
                 result = self.service.historical_var(raw)
+            elif self.path == "/market-risk/var-backtest":
+                result = self.service.var_backtest(raw)
             else:
                 result = self.service.stress_test(raw)
         except ServiceError as exc:

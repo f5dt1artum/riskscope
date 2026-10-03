@@ -1,9 +1,10 @@
 """Core service surface for RiskScope.
 
 The frozen baseline reports process health; historical-simulation VaR and
-expected shortfall now live behind :meth:`Service.historical_var` and batch
-sensitivity stress tests behind :meth:`Service.stress_test`. The public
-surface stays backward compatible.
+expected shortfall now live behind :meth:`Service.historical_var`, batch
+sensitivity stress tests behind :meth:`Service.stress_test`, and VaR
+backtesting behind :meth:`Service.var_backtest`. The public surface stays
+backward compatible.
 """
 
 from __future__ import annotations
@@ -58,16 +59,29 @@ def _reject_constant(value: str) -> None:
 
 
 def _is_finite_number(value: object) -> bool:
-    # bool is a subclass of int but is not a risk number.
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)  # type: ignore[arg-type]
-    )
+    # bool is a subclass of int but is not a risk number; an oversized JSON
+    # integer raises OverflowError when tested against the float64 domain.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)  # type: ignore[arg-type]
+    except OverflowError:
+        return False
 
 
 def _is_nonempty_str(value: object) -> bool:
     return isinstance(value, str) and len(value) > 0
+
+
+def _count_log(count: int, probability: float) -> float:
+    """Return ``count * log(probability)`` with the ``0 log 0`` convention.
+
+    When the count is zero the constrained-probability logarithm can be
+    ``log(0)``; that whole term is defined as zero rather than raising.
+    """
+    if count == 0:
+        return 0.0
+    return count * math.log(probability)
 
 
 def _reconcile_totals(values: list[float], target: float) -> None:
@@ -163,6 +177,18 @@ class Service:
         raise :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._stress_test(self._load_object(raw))
+
+    def var_backtest(self, raw: bytes | str) -> dict:
+        """Validate a VaR backtest request and run the coverage check.
+
+        Each observation pairs a daily VaR forecast with the realized P&L.
+        A breach occurs when the realized loss ``-realized_pnl`` strictly
+        exceeds the forecast ``var``. Breach counts feed the Kupiec
+        unconditional-coverage likelihood-ratio test. Parse failures and
+        non-object payloads raise :class:`InvalidRequest`; semantic problems
+        raise :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._var_backtest(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -430,5 +456,104 @@ class Service:
             "worst_scenario": {
                 "id": scenarios[worst_index][0],
                 "loss": worst_loss,
+            },
+        }
+
+    def _var_backtest(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not isinstance(currency, str) or len(currency) == 0:
+            raise InvalidInput()
+
+        confidence = payload.get("confidence")
+        if not _is_finite_number(confidence) or not 0 < confidence < 1:
+            raise InvalidInput()
+
+        significance_raw = payload.get("significance", 0.05)
+        if not _is_finite_number(significance_raw) or not 0 < significance_raw < 1:
+            raise InvalidInput()
+        significance = float(significance_raw)
+
+        observations_raw = payload.get("observations")
+        if not isinstance(observations_raw, list):
+            raise InvalidInput()
+        if len(observations_raw) > MAX_OBSERVATIONS:
+            raise RequestTooLarge(f"at most {MAX_OBSERVATIONS} observations are allowed")
+        if not 2 <= len(observations_raw):
+            raise InvalidInput()
+
+        observations: list[tuple[str, float, float]] = []
+        seen_dates: set[str] = set()
+        for observation in observations_raw:
+            if not isinstance(observation, dict):
+                raise InvalidInput()
+            date = observation.get("date")
+            if not _is_nonempty_str(date):
+                raise InvalidInput()
+            if date in seen_dates:
+                raise InvalidInput("duplicate_observation", "observation dates must be unique")
+            seen_dates.add(date)
+            var_value_raw = observation.get("var")
+            if not _is_finite_number(var_value_raw) or var_value_raw < 0:
+                raise InvalidInput()
+            realized_pnl_raw = observation.get("realized_pnl")
+            if not _is_finite_number(realized_pnl_raw):
+                raise InvalidInput()
+            var_value = float(var_value_raw)
+            realized_pnl = float(realized_pnl_raw)
+            observations.append((date, var_value, realized_pnl))
+
+        details: list[dict] = []
+        breach_count = 0
+        for date, var_value, realized_pnl in observations:
+            loss = -realized_pnl
+            if loss == 0.0:
+                # Emit a canonical +0.0 rather than -0.0 in the wire body.
+                loss = 0.0
+            # Strictly greater: a loss equal to the VaR forecast is not a breach.
+            breach = loss > var_value
+            if breach:
+                breach_count += 1
+            details.append(
+                {
+                    "date": date,
+                    "var": var_value,
+                    "realized_pnl": realized_pnl,
+                    "loss": loss,
+                    "breach": breach,
+                }
+            )
+
+        n = len(observations)
+        x = breach_count
+        p = 1.0 - float(confidence)
+        observed_rate = x / n
+        lr_statistic = -2.0 * (
+            _count_log(n - x, 1.0 - p)
+            + _count_log(x, p)
+            - _count_log(n - x, 1.0 - observed_rate)
+            - _count_log(x, observed_rate)
+        )
+        if not math.isfinite(lr_statistic):
+            raise InvalidInput(message="backtest computation overflowed")
+        # The statistic is theoretically non-negative; tiny negatives born of
+        # floating-point rounding are clamped to zero.
+        if lr_statistic < 0.0:
+            lr_statistic = 0.0
+        p_value = math.erfc(math.sqrt(lr_statistic / 2.0))
+        if not math.isfinite(p_value):
+            raise InvalidInput(message="backtest computation overflowed")
+
+        return {
+            "currency": currency,
+            "confidence": float(confidence),
+            "significance": significance,
+            "observations": details,
+            "observation_count": n,
+            "breach_count": x,
+            "breach_rate": x / n,
+            "kupiec": {
+                "lr_statistic": lr_statistic,
+                "p_value": p_value,
+                "accepted": p_value >= significance,
             },
         }
