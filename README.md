@@ -97,6 +97,30 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 响应回显 `factors` 并返回 `observation_count`、`means`、`volatilities`、`covariance_matrix`、`correlation_matrix`。均值为算术平均；协方差为去均值乘积之和除以 n-1；波动率为协方差对角元素的非负平方根；相关系数为协方差除以两侧波动率，零波动因子与其他因子为 0.0、自身为 1.0。矩阵对称，计算不按 `date` 排序；任一计算出现非有限值时整次失败，不返回部分结果。
 - 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空集合、类型错误、收益率非法、观察不足）、`422 duplicate_factor`、`422 duplicate_observation`、`422 missing_factor`、`413 request_too_large`（因子超过 100 个、观察超过 10000 条，或因子数 × 观察数超过 1000000；边界值允许处理）。
 
+## 参数法 VaR（Delta-Normal）
+
+`POST /market-risk/parametric-var` 以零均值 Delta-Normal 法计算组合 VaR 与预期损失：
+
+```json
+{
+  "currency": "USD",
+  "confidence": 0.99,
+  "factors": ["eq", "ir"],
+  "positions": [
+    {"id": "p1", "sensitivities": {"eq": 100.0, "ir": 50.0}},
+    {"id": "p2", "sensitivities": {"eq": -20.0}}
+  ],
+  "covariance_matrix": [
+    [0.04, 0.0],
+    [0.0, 0.01]
+  ]
+}
+```
+
+- `currency` 为非空字符串，默认 `USD`；`confidence` 为 (0,1) 内有限数；`factors` 为非空有序数组，因子名唯一非空；`positions` 非空，每项含唯一非空 `id` 与 `sensitivities` 对象，敏感度只能引用已声明因子，缺项按零处理，额外字段忽略。`covariance_matrix` 顺序同 `factors`，须为 n×n 有限数矩阵，并在 1e-12 相对容差内对称且半正定。数值拒绝布尔值、NaN、Infinity 与超大整数。
+- 汇总向量 `s` 后计算 `variance = sᵀΣs`、`volatility = sqrt(variance)`、`var = z × volatility`、`expected_shortfall = φ(z) × volatility / (1 - confidence)`，其中 `z`、`φ` 为标准正态分位数与密度。响应含 `currency`、`confidence`、`factors`、按 `factors` 顺序的 `aggregate_sensitivities` 及 `variance`、`volatility`、`var`、`expected_shortfall` 四项指标。波动率为零时 `var` 与 `expected_shortfall` 均为 0.0；同一容差内的微小负 variance 按零处理，其他负值或非有限结果整次失败，不返回部分结果。
+- 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_covariance`（矩阵不对称或非半正定）、`422 duplicate_factor`、`422 duplicate_position`、`422 unknown_factor`、`422 invalid_input`（其他输入或计算错误）、`413 request_too_large`（因子超过 100 个、头寸超过 10000 个，或因子数 × 头寸数超过 1000000；边界值允许处理）。
+
 ## 交易对手信用敞口与预期信用损失
 
 `POST /credit-risk/counterparty-exposure` 按净额结算集汇总交易敞口并计算预期损失：

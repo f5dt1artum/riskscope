@@ -7,7 +7,9 @@ credit exposure and expected loss live behind
 :meth:`Service.counterparty_exposure`. Liquidity gap analysis by maturity
 bucket lives behind :meth:`Service.liquidity_gap`. Sample covariance
 estimation from synchronized factor returns lives behind
-:meth:`Service.covariance_estimate`. The public surface stays
+:meth:`Service.covariance_estimate`. Zero-mean Delta-Normal
+(parametric) VaR and expected shortfall live behind
+:meth:`Service.parametric_var`. The public surface stays
 backward compatible.
 """
 
@@ -16,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 from decimal import Decimal, ROUND_CEILING
+from statistics import NormalDist
 
 from . import __version__
 
@@ -26,6 +29,15 @@ MAX_TRADES = 10000
 MAX_NETTING_SETS = 1000
 MAX_FACTORS = 100
 MAX_FACTOR_OBSERVATION_PAIRS = 1000000
+MAX_POSITIONS = 10000
+MAX_FACTOR_POSITION_PAIRS = 1000000
+
+# Relative tolerance for covariance-matrix symmetry, positive
+# semidefiniteness, and the tiny negative variance that floating-point
+# rounding can leave behind.
+_COVARIANCE_RTOL = 1e-12
+
+_STANDARD_NORMAL = NormalDist()
 
 
 class ServiceError(Exception):
@@ -225,6 +237,23 @@ class Service:
         :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._covariance_estimate(self._load_object(raw))
+
+    def parametric_var(self, raw: bytes | str) -> dict:
+        """Validate a parametric VaR request and compute the result.
+
+        Zero-mean Delta-Normal method: the aggregate sensitivity vector
+        ``s`` (in ``factors`` order) combines with the supplied covariance
+        matrix ``Σ`` into ``variance = sᵀΣs``, ``volatility = sqrt(variance)``,
+        ``var = z × volatility`` and ``expected_shortfall = φ(z) ×
+        volatility / (1 - confidence)``, where ``z`` and ``φ`` are the
+        standard normal quantile and density. A zero volatility yields
+        ``0.0`` for both tail metrics. Parse failures and non-object
+        payloads raise :class:`InvalidRequest`; an asymmetric or
+        non-positive-semidefinite matrix raises :class:`InvalidInput` with
+        code ``invalid_covariance``; other semantic problems raise
+        :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._parametric_var(self._load_object(raw))
 
     def counterparty_exposure(self, raw: bytes | str) -> dict:
         """Validate a counterparty credit exposure request and compute it.
@@ -631,6 +660,200 @@ class Service:
             "volatilities": volatilities,
             "covariance_matrix": covariance,
             "correlation_matrix": correlation,
+        }
+
+    @staticmethod
+    def _check_covariance(matrix: list[list[float]]) -> None:
+        """Enforce symmetry and positive semidefiniteness of ``matrix``.
+
+        Both properties hold within a ``1e-12`` relative tolerance, so a
+        matrix assembled from independently rounded estimates is not
+        rejected on noise alone. Violations raise :class:`InvalidInput`
+        with code ``invalid_covariance``.
+        """
+        n = len(matrix)
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = matrix[i][j], matrix[j][i]
+                if abs(a - b) > _COVARIANCE_RTOL * max(abs(a), abs(b)):
+                    raise InvalidInput(
+                        "invalid_covariance", "covariance matrix must be symmetric"
+                    )
+
+        # Semidefinite Cholesky: a materially negative pivot, or a
+        # materially nonzero column below a zero pivot, means the matrix
+        # is not positive semidefinite. The scale comes from the largest
+        # diagonal magnitude, so the tolerance is relative.
+        scale = max(abs(matrix[i][i]) for i in range(n))
+        tol = _COVARIANCE_RTOL * scale
+        lower = [[0.0] * n for _ in range(n)]
+        for j in range(n):
+            pivot = matrix[j][j] - sum(lower[j][k] ** 2 for k in range(j))
+            if pivot < -tol:
+                raise InvalidInput(
+                    "invalid_covariance",
+                    "covariance matrix must be positive semidefinite",
+                )
+            if pivot <= 0.0:
+                for i in range(j + 1, n):
+                    residual = matrix[i][j] - sum(
+                        lower[i][k] * lower[j][k] for k in range(j)
+                    )
+                    if abs(residual) > tol:
+                        raise InvalidInput(
+                            "invalid_covariance",
+                            "covariance matrix must be positive semidefinite",
+                        )
+                continue
+            lower[j][j] = math.sqrt(pivot)
+            for i in range(j + 1, n):
+                lower[i][j] = (
+                    matrix[i][j]
+                    - sum(lower[i][k] * lower[j][k] for k in range(j))
+                ) / lower[j][j]
+
+    def _parametric_var(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not _is_nonempty_str(currency):
+            raise InvalidInput()
+
+        confidence = _strict_float(payload.get("confidence"))
+        if not 0 < confidence < 1:
+            raise InvalidInput()
+
+        factors_raw = payload.get("factors")
+        if not isinstance(factors_raw, list) or len(factors_raw) == 0:
+            raise InvalidInput()
+        if len(factors_raw) > MAX_FACTORS:
+            raise RequestTooLarge(f"at most {MAX_FACTORS} factors are allowed")
+        factors: list[str] = []
+        for factor in factors_raw:
+            if not _is_nonempty_str(factor):
+                raise InvalidInput()
+            factors.append(factor)
+        seen_factors: set[str] = set()
+        for factor in factors:
+            if factor in seen_factors:
+                raise InvalidInput("duplicate_factor", "factor names must be unique")
+            seen_factors.add(factor)
+
+        positions_raw = payload.get("positions")
+        if not isinstance(positions_raw, list) or len(positions_raw) == 0:
+            raise InvalidInput()
+        if len(positions_raw) > MAX_POSITIONS:
+            raise RequestTooLarge(f"at most {MAX_POSITIONS} positions are allowed")
+        if len(factors) * len(positions_raw) > MAX_FACTOR_POSITION_PAIRS:
+            raise RequestTooLarge(
+                "factors times positions must not exceed "
+                f"{MAX_FACTOR_POSITION_PAIRS}"
+            )
+        positions: list[tuple[str, dict[str, float]]] = []
+        for position in positions_raw:
+            if not isinstance(position, dict):
+                raise InvalidInput()
+            position_id = position.get("id")
+            if not _is_nonempty_str(position_id):
+                raise InvalidInput()
+            sensitivities_raw = position.get("sensitivities")
+            if not isinstance(sensitivities_raw, dict):
+                raise InvalidInput()
+            # Narrow once so aggregation can never hit an oversized int.
+            sensitivities = {
+                factor: _strict_float(value)
+                for factor, value in sensitivities_raw.items()
+            }
+            positions.append((position_id, sensitivities))
+
+        seen_position_ids: set[str] = set()
+        for position_id, _ in positions:
+            if position_id in seen_position_ids:
+                raise InvalidInput("duplicate_position", "position ids must be unique")
+            seen_position_ids.add(position_id)
+
+        declared = set(factors)
+        for position_id, sensitivities in positions:
+            for factor in sensitivities:
+                if factor not in declared:
+                    raise InvalidInput(
+                        "unknown_factor",
+                        f"position {position_id!r} references undeclared factor "
+                        f"{factor!r}",
+                    )
+
+        matrix_raw = payload.get("covariance_matrix")
+        n = len(factors)
+        if not isinstance(matrix_raw, list) or len(matrix_raw) != n:
+            raise InvalidInput()
+        matrix: list[list[float]] = []
+        for row in matrix_raw:
+            if not isinstance(row, list) or len(row) != n:
+                raise InvalidInput()
+            matrix.append([_strict_float(value) for value in row])
+        self._check_covariance(matrix)
+
+        # Aggregate per-factor sensitivity across positions (input order);
+        # a factor a position does not reference contributes zero.
+        factor_index = {factor: j for j, factor in enumerate(factors)}
+        aggregate = [0.0] * n
+        for _, sensitivities in positions:
+            for factor, value in sensitivities.items():
+                aggregate[factor_index[factor]] += value
+        for value in aggregate:
+            if not math.isfinite(value):
+                raise InvalidInput(
+                    message="parametric computation produced a non-finite result"
+                )
+
+        # variance = sᵀΣs, accumulated row by row. ``abs_scale`` is the
+        # matching sum of absolute terms, the yardstick for deciding
+        # whether a negative variance is mere rounding noise.
+        variance = 0.0
+        abs_scale = 0.0
+        for i in range(n):
+            row_total = 0.0
+            abs_row_total = 0.0
+            for j in range(n):
+                row_total += matrix[i][j] * aggregate[j]
+                abs_row_total += abs(matrix[i][j]) * abs(aggregate[j])
+            variance += aggregate[i] * row_total
+            abs_scale += abs(aggregate[i]) * abs_row_total
+        if not math.isfinite(variance):
+            raise InvalidInput(
+                message="parametric computation produced a non-finite result"
+            )
+        if variance < 0.0:
+            if variance < -_COVARIANCE_RTOL * abs_scale:
+                raise InvalidInput(
+                    message="parametric computation produced a negative variance"
+                )
+            variance = 0.0
+        elif variance == 0.0:
+            # Emit a canonical +0.0 rather than a signed zero.
+            variance = 0.0
+
+        volatility = math.sqrt(variance)
+        if volatility == 0.0:
+            var = 0.0
+            expected_shortfall = 0.0
+        else:
+            z = _STANDARD_NORMAL.inv_cdf(confidence)
+            density = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+            var = z * volatility
+            expected_shortfall = density * volatility / (1.0 - confidence)
+            if not math.isfinite(var) or not math.isfinite(expected_shortfall):
+                raise InvalidInput(
+                    message="parametric computation produced a non-finite result"
+                )
+
+        return {
+            "currency": currency,
+            "confidence": confidence,
+            "factors": factors,
+            "aggregate_sensitivities": aggregate,
+            "variance": variance,
+            "volatility": volatility,
+            "var": var,
+            "expected_shortfall": expected_shortfall,
         }
 
     def _stress_test(self, payload: dict) -> dict:

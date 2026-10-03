@@ -41,6 +41,7 @@ class Handler(BaseHTTPRequestHandler):
             "/market-risk/stress-test",
             "/market-risk/var-backtest",
             "/market-risk/covariance-estimate",
+            "/market-risk/parametric-var",
             "/credit-risk/counterparty-exposure",
             "/liquidity-risk/liquidity-gap",
         ):
@@ -62,6 +63,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.var_backtest(raw)
             elif self.path == "/market-risk/covariance-estimate":
                 result = self.service.covariance_estimate(raw)
+            elif self.path == "/market-risk/parametric-var":
+                result = self.service.parametric_var(raw)
             elif self.path == "/credit-risk/counterparty-exposure":
                 result = self.service.counterparty_exposure(raw)
             elif self.path == "/liquidity-risk/liquidity-gap":
