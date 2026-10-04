@@ -11,8 +11,9 @@ estimation from synchronized factor returns lives behind
 (parametric) VaR and expected shortfall live behind
 :meth:`Service.parametric_var`. Cross-book, multi-currency position
 aggregation with FX conversion lives behind
-:meth:`Service.portfolio_aggregate`. The public surface stays
-backward compatible.
+:meth:`Service.portfolio_aggregate`. Risk limit monitoring against
+caller-supplied measurements lives behind :meth:`Service.limit_check`.
+The public surface stays backward compatible.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ MAX_POSITIONS = 10000
 MAX_FACTOR_POSITION_PAIRS = 1000000
 MAX_FX_RATES = 1000
 MAX_SENSITIVITY_ENTRIES = 1000000
+MAX_LIMITS = 10000
+MAX_MEASUREMENTS = 10000
 
 # Relative tolerance for covariance-matrix symmetry, positive
 # semidefiniteness, and the tiny negative variance that floating-point
@@ -299,6 +302,24 @@ class Service:
         ``missing_fx_rate``.
         """
         return self._portfolio_aggregate(self._load_object(raw))
+
+    def limit_check(self, raw: bytes | str) -> dict:
+        """Validate a limit-monitoring request and evaluate each limit.
+
+        The caller supplies the measurements; this endpoint never invokes
+        the other calculators, converts currencies, or keeps history. Each
+        declared limit is matched with at most one measurement: with one,
+        ``utilization = value / limit`` and ``headroom = limit - value``
+        are reported and the status is ``breach`` (``value >= limit``),
+        ``warning`` (``value >= limit * warning_ratio``) or ``ok``;
+        without one the evaluation fields are ``null`` and the status is
+        ``no_data``. Parse failures and non-object payloads raise
+        :class:`InvalidRequest`; semantic problems raise
+        :class:`InvalidInput` (with codes ``duplicate_limit``,
+        ``duplicate_measurement`` or ``unknown_limit`` where applicable)
+        or :class:`RequestTooLarge`.
+        """
+        return self._limit_check(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -1591,4 +1612,146 @@ class Service:
                     for factor in factor_order
                 },
             },
+        }
+
+    def _limit_check(self, payload: dict) -> dict:
+        as_of = payload.get("as_of")
+        if not _is_nonempty_str(as_of):
+            raise InvalidInput()
+
+        limits_raw = payload.get("limits")
+        if not isinstance(limits_raw, list) or len(limits_raw) == 0:
+            raise InvalidInput()
+        if len(limits_raw) > MAX_LIMITS:
+            raise RequestTooLarge(f"at most {MAX_LIMITS} limits are allowed")
+        limits: list[dict] = []
+        for entry in limits_raw:
+            if not isinstance(entry, dict):
+                raise InvalidInput()
+            limit_id = entry.get("id")
+            if not _is_nonempty_str(limit_id):
+                raise InvalidInput()
+            scope = entry.get("scope")
+            if not isinstance(scope, dict):
+                raise InvalidInput()
+            scope_type = scope.get("type")
+            scope_id = scope.get("id")
+            if not _is_nonempty_str(scope_type) or not _is_nonempty_str(scope_id):
+                raise InvalidInput()
+            metric = entry.get("metric")
+            if not _is_nonempty_str(metric):
+                raise InvalidInput()
+            unit = entry.get("unit")
+            if not _is_nonempty_str(unit):
+                raise InvalidInput()
+            limit_value = _strict_float(entry.get("limit"))
+            if not limit_value > 0.0:
+                raise InvalidInput()
+            warning_ratio = _strict_float(entry.get("warning_ratio", 0.8))
+            if not 0.0 < warning_ratio < 1.0:
+                raise InvalidInput()
+            limits.append(
+                {
+                    "id": limit_id,
+                    "scope": {"type": scope_type, "id": scope_id},
+                    "metric": metric,
+                    "unit": unit,
+                    "limit": limit_value,
+                    "warning_ratio": warning_ratio,
+                }
+            )
+
+        measurements_raw = payload.get("measurements", [])
+        if not isinstance(measurements_raw, list):
+            raise InvalidInput()
+        if len(measurements_raw) > MAX_MEASUREMENTS:
+            raise RequestTooLarge(
+                f"at most {MAX_MEASUREMENTS} measurements are allowed"
+            )
+        measurements: list[dict] = []
+        for entry in measurements_raw:
+            if not isinstance(entry, dict):
+                raise InvalidInput()
+            limit_id = entry.get("limit_id")
+            if not _is_nonempty_str(limit_id):
+                raise InvalidInput()
+            value = _strict_float(entry.get("value"))
+            if value < 0.0:
+                raise InvalidInput()
+            measurements.append({"limit_id": limit_id, "value": value})
+
+        seen_limit_ids: set[str] = set()
+        for limit in limits:
+            if limit["id"] in seen_limit_ids:
+                raise InvalidInput("duplicate_limit", "limit ids must be unique")
+            seen_limit_ids.add(limit["id"])
+
+        seen_measurement_ids: set[str] = set()
+        for measurement in measurements:
+            if measurement["limit_id"] in seen_measurement_ids:
+                raise InvalidInput(
+                    "duplicate_measurement",
+                    "at most one measurement per limit is allowed",
+                )
+            seen_measurement_ids.add(measurement["limit_id"])
+
+        values_by_limit: dict[str, float] = {}
+        for measurement in measurements:
+            if measurement["limit_id"] not in seen_limit_ids:
+                raise InvalidInput(
+                    "unknown_limit",
+                    f"measurement references undeclared limit "
+                    f"{measurement['limit_id']!r}",
+                )
+            values_by_limit[measurement["limit_id"]] = measurement["value"]
+
+        evaluated: list[dict] = []
+        alerts: list[dict] = []
+        summary = {"ok": 0, "warning": 0, "breach": 0, "no_data": 0}
+        for limit in limits:
+            entry = dict(limit)
+            if limit["id"] in values_by_limit:
+                value = values_by_limit[limit["id"]]
+                limit_value = limit["limit"]
+                utilization = value / limit_value
+                headroom = limit_value - value
+                if not math.isfinite(utilization) or not math.isfinite(headroom):
+                    raise InvalidInput(
+                        message="limit evaluation produced a non-finite result"
+                    )
+                if value >= limit_value:
+                    status = "breach"
+                elif value >= limit_value * limit["warning_ratio"]:
+                    status = "warning"
+                else:
+                    status = "ok"
+                entry["value"] = value
+                entry["utilization"] = utilization
+                entry["headroom"] = headroom
+            else:
+                status = "no_data"
+                entry["value"] = None
+                entry["utilization"] = None
+                entry["headroom"] = None
+            entry["status"] = status
+            summary[status] += 1
+            if status in ("warning", "breach"):
+                alerts.append(entry)
+            evaluated.append(entry)
+
+        if summary["breach"] > 0:
+            overall_status = "breach"
+        elif summary["warning"] > 0:
+            overall_status = "warning"
+        elif summary["no_data"] > 0:
+            overall_status = "incomplete"
+        else:
+            overall_status = "ok"
+
+        return {
+            "as_of": as_of,
+            "limits": evaluated,
+            "alerts": alerts,
+            "summary": summary,
+            "overall_status": overall_status,
         }
