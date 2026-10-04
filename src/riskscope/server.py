@@ -46,6 +46,7 @@ class Handler(BaseHTTPRequestHandler):
             "/market-risk/discounted-cashflow",
             "/credit-risk/counterparty-exposure",
             "/credit-risk/expected-loss-schedule",
+            "/credit-risk/irb-capital",
             "/liquidity-risk/liquidity-gap",
             "/portfolio-risk/aggregate",
             "/risk-management/limit-check",
@@ -78,6 +79,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.counterparty_exposure(raw)
             elif self.path == "/credit-risk/expected-loss-schedule":
                 result = self.service.expected_loss_schedule(raw)
+            elif self.path == "/credit-risk/irb-capital":
+                result = self.service.irb_capital(raw)
             elif self.path == "/liquidity-risk/liquidity-gap":
                 result = self.service.liquidity_gap(raw)
             elif self.path == "/portfolio-risk/aggregate":
