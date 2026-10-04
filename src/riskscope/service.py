@@ -257,6 +257,22 @@ class Service:
         """
         return self._var_backtest(self._load_object(raw))
 
+    def var_backtest_validation(self, raw: bytes | str) -> dict:
+        """Validate a VaR backtest request and run the Christoffersen tests.
+
+        The request semantics, defaults and breach decision are identical
+        to :meth:`var_backtest`; on top of the Kupiec result the response
+        reports the four first-order Markov transition counts (``n00``,
+        ``n01``, ``n10``, ``n11``) and two tests: ``independence`` (a
+        likelihood-ratio test of clustering, chi-square with one degree of
+        freedom) and ``conditional_coverage`` (Kupiec plus independence,
+        chi-square with two degrees of freedom). A predecessor state that
+        never occurs leaves ``q0`` or ``q1`` null. Parse failures and
+        non-object payloads raise :class:`InvalidRequest`; semantic
+        problems raise :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._var_backtest_validation(self._load_object(raw))
+
     def covariance_estimate(self, raw: bytes | str) -> dict:
         """Validate a covariance-estimation request and compute it.
 
@@ -538,7 +554,14 @@ class Service:
             raise InvalidInput(message="backtest computation produced a non-finite result")
         return count * math.log(probability)
 
-    def _var_backtest(self, payload: dict) -> dict:
+    def _parse_var_backtest(self, payload: dict) -> tuple[str, float, float, list[dict]]:
+        """Validate a VaR backtest request into its shared inputs.
+
+        Both the Kupiec backtest and the Christoffersen validation route
+        accept exactly this request shape; the breach indicator on each
+        row follows the frozen ``-realized_pnl > var`` rule (equality does
+        not breach).
+        """
         currency = payload.get("currency", "USD")
         if not isinstance(currency, str) or len(currency) == 0:
             raise InvalidInput()
@@ -591,6 +614,15 @@ class Service:
                 raise InvalidInput("duplicate_observation", "observation dates must be unique")
             seen_dates.add(date)
 
+        return currency, confidence, significance, rows
+
+    def _run_var_backtest(
+        self,
+        currency: str,
+        confidence: float,
+        significance: float,
+        rows: list[dict],
+    ) -> dict:
         n = len(rows)
         x = sum(1 for row in rows if row["breach"])
         breach_rate = x / n
@@ -629,6 +661,140 @@ class Service:
                 "accepted": p_value >= significance,
             },
         }
+
+    def _var_backtest(self, payload: dict) -> dict:
+        currency, confidence, significance, rows = self._parse_var_backtest(payload)
+        return self._run_var_backtest(currency, confidence, significance, rows)
+
+    @staticmethod
+    def _markov_term(count: int, probability: float) -> float:
+        """One ``count * ln(probability)`` transition log-likelihood term.
+
+        ``0 * ln 0`` is defined as 0 here. A transition that never leaves a
+        given predecessor state leaves its conditional probability
+        undefined (handled by the caller); any other positive count paired
+        with a probability outside (0, 1] is a non-finite term.
+        """
+        if count == 0:
+            return 0.0
+        if probability <= 0.0 or probability > 1.0:
+            raise InvalidInput(
+                message="backtest validation produced a non-finite result"
+            )
+        return count * math.log(probability)
+
+    def _run_var_backtest_validation(
+        self,
+        currency: str,
+        confidence: float,
+        significance: float,
+        rows: list[dict],
+    ) -> dict:
+        result = self._run_var_backtest(currency, confidence, significance, rows)
+        n = result["observation_count"]
+
+        # Christoffersen (1998) first-order Markov transition counts over
+        # adjacent breach states in observation order: n_ij counts a
+        # transition from state i on one day to state j on the next.
+        n00 = n01 = n10 = n11 = 0
+        previous = rows[0]["breach"]
+        for row in rows[1:]:
+            current = row["breach"]
+            if not previous and not current:
+                n00 += 1
+            elif not previous and current:
+                n01 += 1
+            elif previous and not current:
+                n10 += 1
+            else:
+                n11 += 1
+            previous = current
+
+        q = (n01 + n11) / (n - 1)
+        ln_l0 = (
+            self._markov_term(n00 + n10, 1.0 - q)
+            + self._markov_term(n01 + n11, q)
+        )
+
+        # A predecessor state that never occurs leaves its conditional
+        # breach probability undefined; its likelihood contribution is 0.
+        q0: float | None
+        q1: float | None
+        ln_l1 = 0.0
+        if n00 + n01 > 0:
+            q0 = n01 / (n00 + n01)
+            ln_l1 += self._markov_term(n00, 1.0 - q0) + self._markov_term(n01, q0)
+        else:
+            q0 = None
+        if n10 + n11 > 0:
+            q1 = n11 / (n10 + n11)
+            ln_l1 += self._markov_term(n10, 1.0 - q1) + self._markov_term(n11, q1)
+        else:
+            q1 = None
+
+        if not math.isfinite(ln_l0) or not math.isfinite(ln_l1):
+            raise InvalidInput(
+                message="backtest validation produced a non-finite result"
+            )
+
+        # The constrained model nests in the two-parameter alternative, so
+        # the statistic cannot be negative; a tiny negative remainder is
+        # floating-point noise around zero.
+        lr_ind = 2.0 * (ln_l1 - ln_l0)
+        if lr_ind < 0.0:
+            lr_ind = 0.0
+        if not math.isfinite(lr_ind):
+            raise InvalidInput(
+                message="backtest validation produced a non-finite result"
+            )
+        ind_p_value = math.erfc(math.sqrt(lr_ind / 2.0))
+        if not math.isfinite(ind_p_value):
+            raise InvalidInput(
+                message="backtest validation produced a non-finite result"
+            )
+
+        # Conditional coverage combines Kupiec's unconditional-coverage
+        # statistic with the independence statistic and is chi-square with
+        # two degrees of freedom, whose survival function is exp(-lr/2).
+        cc_lr = result["kupiec"]["lr_statistic"] + lr_ind
+        if not math.isfinite(cc_lr):
+            raise InvalidInput(
+                message="backtest validation produced a non-finite result"
+            )
+        cc_p_value = math.exp(-cc_lr / 2.0)
+        if not math.isfinite(cc_p_value):
+            raise InvalidInput(
+                message="backtest validation produced a non-finite result"
+            )
+
+        result.update(
+            {
+                "n00": n00,
+                "n01": n01,
+                "n10": n10,
+                "n11": n11,
+                "independence": {
+                    "lr_statistic": lr_ind,
+                    "p_value": ind_p_value,
+                    "accepted": ind_p_value >= significance,
+                    "q": q,
+                    "q0": q0,
+                    "q1": q1,
+                },
+                "conditional_coverage": {
+                    "lr_statistic": cc_lr,
+                    "p_value": cc_p_value,
+                    "accepted": cc_p_value >= significance,
+                },
+            }
+        )
+        return result
+
+    def _var_backtest_validation(self, payload: dict) -> dict:
+        currency, confidence, significance, rows = self._parse_var_backtest(payload)
+        return self._run_var_backtest_validation(
+            currency, confidence, significance, rows
+        )
 
     def _covariance_estimate(self, payload: dict) -> dict:
         factors_raw = payload.get("factors")
