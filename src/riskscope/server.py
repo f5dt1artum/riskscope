@@ -43,6 +43,7 @@ class Handler(BaseHTTPRequestHandler):
             "/market-risk/covariance-estimate",
             "/market-risk/parametric-var",
             "/credit-risk/counterparty-exposure",
+            "/credit-risk/expected-loss-schedule",
             "/liquidity-risk/liquidity-gap",
             "/portfolio-risk/aggregate",
             "/risk-management/limit-check",
@@ -69,6 +70,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.parametric_var(raw)
             elif self.path == "/credit-risk/counterparty-exposure":
                 result = self.service.counterparty_exposure(raw)
+            elif self.path == "/credit-risk/expected-loss-schedule":
+                result = self.service.expected_loss_schedule(raw)
             elif self.path == "/liquidity-risk/liquidity-gap":
                 result = self.service.liquidity_gap(raw)
             elif self.path == "/portfolio-risk/aggregate":
