@@ -15,10 +15,12 @@ aggregation with FX conversion lives behind
 against caller-supplied measurements lives behind
 :meth:`Service.limit_check`. Multi-period expected credit loss from
 term-structure default probabilities and exposure forecasts lives
-behind :meth:`Service.expected_loss_schedule`. Discounted cashflow
-valuation off a zero-rate curve, with key-rate sensitivities, lives
-behind :meth:`Service.discounted_cashflow`. The public surface stays
-backward compatible.
+behind :meth:`Service.expected_loss_schedule`. Foundation-IRB capital
+requirements under the Basel corporate correlation and maturity
+adjustment live behind :meth:`Service.irb_capital`. Discounted
+cashflow valuation off a zero-rate curve, with key-rate sensitivities,
+lives behind :meth:`Service.discounted_cashflow`. The public surface
+stays backward compatible.
 """
 
 from __future__ import annotations
@@ -47,6 +49,8 @@ MAX_MEASUREMENTS = 10000
 MAX_SCHEDULE_COUNTERPARTIES = 1000
 MAX_SCHEDULE_FACILITIES = 10000
 MAX_SCHEDULE_PERIOD_FACILITY_PAIRS = 1000000
+MAX_IRB_COUNTERPARTIES = 1000
+MAX_IRB_FACILITIES = 10000
 MAX_CURVE_POINTS = 100
 MAX_CASHFLOWS = 100000
 
@@ -382,6 +386,27 @@ class Service:
         ``unknown_counterparty`` codes) or :class:`RequestTooLarge`.
         """
         return self._expected_loss_schedule(self._load_object(raw))
+
+    def irb_capital(self, raw: bytes | str) -> dict:
+        """Validate a foundation-IRB capital request and compute it.
+
+        Each facility borrows the PD of its counterparty. With the Basel
+        corporate asset correlation ``R`` and maturity adjustment ``MA``,
+        the capital requirement per unit exposure is
+
+        ``K = lgd * (Phi((Phi^-1(PD) + sqrt(R) * Phi^-1(0.999)) /
+        sqrt(1 - R)) - PD) * MA``;
+
+        ``capital_requirement = ead * K`` and
+        ``risk_weighted_assets = 12.5 * capital_requirement``. Facilities
+        roll up into their counterparty and the counterparties into the
+        portfolio total, all in input order. Parse failures and
+        non-object payloads raise :class:`InvalidRequest`; semantic
+        problems raise :class:`InvalidInput` (including the
+        ``duplicate_counterparty``, ``duplicate_facility`` and
+        ``unknown_counterparty`` codes) or :class:`RequestTooLarge`.
+        """
+        return self._irb_capital(self._load_object(raw))
 
     def discounted_cashflow(self, raw: bytes | str) -> dict:
         """Validate a discounted-cashflow request and value the positions.
@@ -2243,6 +2268,176 @@ class Service:
                 ],
                 "total_discounted_expected_loss": portfolio_total,
             },
+        }
+
+    def _irb_capital(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not _is_nonempty_str(currency):
+            raise InvalidInput()
+
+        counterparties_raw = payload.get("counterparties")
+        if not isinstance(counterparties_raw, list) or len(counterparties_raw) == 0:
+            raise InvalidInput()
+        if len(counterparties_raw) > MAX_IRB_COUNTERPARTIES:
+            raise RequestTooLarge(
+                f"at most {MAX_IRB_COUNTERPARTIES} counterparties are allowed"
+            )
+        counterparties: list[dict] = []
+        for counterparty in counterparties_raw:
+            if not isinstance(counterparty, dict):
+                raise InvalidInput()
+            counterparty_id = counterparty.get("id")
+            if not _is_nonempty_str(counterparty_id):
+                raise InvalidInput()
+            pd = _strict_float(counterparty.get("pd"))
+            if not 0.0 < pd < 1.0:
+                raise InvalidInput()
+            counterparties.append({"id": counterparty_id, "pd": pd})
+
+        facilities_raw = payload.get("facilities")
+        if not isinstance(facilities_raw, list) or len(facilities_raw) == 0:
+            raise InvalidInput()
+        if len(facilities_raw) > MAX_IRB_FACILITIES:
+            raise RequestTooLarge(
+                f"at most {MAX_IRB_FACILITIES} facilities are allowed"
+            )
+        facilities: list[dict] = []
+        for facility in facilities_raw:
+            if not isinstance(facility, dict):
+                raise InvalidInput()
+            facility_id = facility.get("id")
+            if not _is_nonempty_str(facility_id):
+                raise InvalidInput()
+            counterparty_id = facility.get("counterparty_id")
+            if not _is_nonempty_str(counterparty_id):
+                raise InvalidInput()
+            lgd = _strict_float(facility.get("lgd"))
+            if not 0.0 <= lgd <= 1.0:
+                raise InvalidInput()
+            ead = _strict_float(facility.get("ead"))
+            if ead < 0.0:
+                raise InvalidInput()
+            maturity = _strict_float(facility.get("maturity"))
+            if not 1.0 <= maturity <= 5.0:
+                raise InvalidInput()
+            facilities.append(
+                {
+                    "id": facility_id,
+                    "counterparty_id": counterparty_id,
+                    "lgd": lgd,
+                    "ead": ead,
+                    "maturity": maturity,
+                }
+            )
+
+        seen_counterparty_ids: set[str] = set()
+        for counterparty in counterparties:
+            if counterparty["id"] in seen_counterparty_ids:
+                raise InvalidInput(
+                    "duplicate_counterparty", "counterparty ids must be unique"
+                )
+            seen_counterparty_ids.add(counterparty["id"])
+
+        seen_facility_ids: set[str] = set()
+        for facility in facilities:
+            if facility["id"] in seen_facility_ids:
+                raise InvalidInput("duplicate_facility", "facility ids must be unique")
+            seen_facility_ids.add(facility["id"])
+
+        counterparty_by_id = {cp["id"]: cp for cp in counterparties}
+        for facility in facilities:
+            if facility["counterparty_id"] not in counterparty_by_id:
+                raise InvalidInput(
+                    "unknown_counterparty",
+                    "facility references an unknown counterparty "
+                    f"{facility['counterparty_id']!r}",
+                )
+
+        def non_finite() -> InvalidInput:
+            return InvalidInput(
+                message="IRB capital computation produced a non-finite result"
+            )
+
+        # Foundation-IRB uses a single non-defaulted corporate exposure
+        # formula: the maturity adjustment scales the unexpected-loss gap
+        # between the 99.9th-percentile conditional default loss and the
+        # expected loss PD, and RWA is 12.5 times the capital requirement.
+        z_999 = _STANDARD_NORMAL.inv_cdf(0.999)
+        denom_50 = 1.0 - math.exp(-50.0)
+
+        facility_results: list[dict] = []
+        for facility in facilities:
+            pd = counterparty_by_id[facility["counterparty_id"]]["pd"]
+            a = (1.0 - math.exp(-50.0 * pd)) / denom_50
+            correlation = 0.12 * a + 0.24 * (1.0 - a)
+            b = (0.11852 - 0.05478 * math.log(pd)) ** 2
+            maturity_adjustment = (
+                1.0 + (facility["maturity"] - 2.5) * b
+            ) / (1.0 - 1.5 * b)
+            z_pd = _STANDARD_NORMAL.inv_cdf(pd)
+            worst_case = _STANDARD_NORMAL.cdf(
+                (z_pd + math.sqrt(correlation) * z_999) / math.sqrt(1.0 - correlation)
+            )
+            k = facility["lgd"] * (worst_case - pd) * maturity_adjustment
+            capital_requirement = facility["ead"] * k
+            risk_weighted_assets = 12.5 * capital_requirement
+            for value in (
+                a,
+                correlation,
+                b,
+                maturity_adjustment,
+                z_pd,
+                worst_case,
+                k,
+                capital_requirement,
+                risk_weighted_assets,
+            ):
+                if not math.isfinite(value):
+                    raise non_finite()
+            facility_results.append(
+                {
+                    "id": facility["id"],
+                    "counterparty_id": facility["counterparty_id"],
+                    "pd": pd,
+                    "R": correlation,
+                    "MA": maturity_adjustment,
+                    "K": k,
+                    "ead": facility["ead"],
+                    "capital_requirement": capital_requirement,
+                    "risk_weighted_assets": risk_weighted_assets,
+                }
+            )
+
+        # Aggregate in counterparty input order so the portfolio totals are
+        # exactly the sequential sum of the counterparty details; a
+        # counterparty without facilities keeps explicit zero values.
+        amount_keys = ("ead", "capital_requirement", "risk_weighted_assets")
+        counterparty_results: list[dict] = []
+        for counterparty in counterparties:
+            totals = {key: 0.0 for key in amount_keys}
+            for result in facility_results:
+                if result["counterparty_id"] != counterparty["id"]:
+                    continue
+                for key in amount_keys:
+                    totals[key] += result[key]
+            for value in totals.values():
+                if not math.isfinite(value):
+                    raise non_finite()
+            counterparty_results.append({"id": counterparty["id"], **totals})
+
+        portfolio_totals = {key: 0.0 for key in amount_keys}
+        for result in counterparty_results:
+            for key in amount_keys:
+                portfolio_totals[key] += result[key]
+        for value in portfolio_totals.values():
+            if not math.isfinite(value):
+                raise non_finite()
+
+        return {
+            "currency": currency,
+            "facilities": facility_results,
+            "counterparties": counterparty_results,
+            "portfolio_totals": portfolio_totals,
         }
 
     def _discounted_cashflow(self, payload: dict) -> dict:
