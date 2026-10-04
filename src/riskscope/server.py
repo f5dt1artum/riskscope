@@ -40,6 +40,7 @@ class Handler(BaseHTTPRequestHandler):
             "/market-risk/historical-var",
             "/market-risk/stress-test",
             "/market-risk/var-backtest",
+            "/market-risk/var-backtest-validation",
             "/market-risk/covariance-estimate",
             "/market-risk/parametric-var",
             "/market-risk/discounted-cashflow",
@@ -65,6 +66,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.historical_var(raw)
             elif self.path == "/market-risk/var-backtest":
                 result = self.service.var_backtest(raw)
+            elif self.path == "/market-risk/var-backtest-validation":
+                result = self.service.var_backtest_validation(raw)
             elif self.path == "/market-risk/covariance-estimate":
                 result = self.service.covariance_estimate(raw)
             elif self.path == "/market-risk/parametric-var":

@@ -78,6 +78,26 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 令 n 为观察数、x 为突破数、`p = 1 - confidence`，按规格公式计算 `kupiec.lr_statistic`（`0·ln0` 按 0 计算，舍入导致的微小负值按 0 处理），`kupiec.p_value = erfc(sqrt(lr_statistic/2))`；`kupiec.accepted` 仅在 `p_value >= significance` 时为 `true`。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_observation`（date 重复）、`413 request_too_large`（超过 10000 条观察；边界值允许处理）。
 
+## VaR 回溯验证（Christoffersen 检验）
+
+`POST /market-risk/var-backtest-validation` 沿用 `/market-risk/var-backtest` 的完整输入语义、默认值与突破判定，按观察输入顺序对相邻突破状态同时执行 Christoffersen 独立性检验与条件覆盖检验：
+
+```json
+{
+  "confidence": 0.95,
+  "significance": 0.05,
+  "observations": [
+    {"date": "2024-01-01", "var": 10.0, "realized_pnl": 5.0},
+    {"date": "2024-01-02", "var": 10.0, "realized_pnl": -15.0}
+  ]
+}
+```
+
+- 输入校验、错误码与 `/market-risk/var-backtest` 完全一致；响应保留其全部内容（明细顺序不变），并增加转移计数 `n00`、`n01`、`n10`、`n11` 以及 `independence`、`conditional_coverage` 两个对象。
+- 相邻突破状态组成 `n00`、`n01`、`n10`、`n11`，令 `q=(n01+n11)/(n-1)`、`q0=n01/(n00+n01)`、`q1=n11/(n10+n11)`。`LRind=2×(lnL1-lnL0)`，其中 `lnL0=(n00+n10)ln(1-q)+(n01+n11)ln(q)`，`lnL1=n00ln(1-q0)+n01ln(q0)+n10ln(1-q1)+n11ln(q1)`；计数为零的对数项按零处理，某前态无转移时相应 `q0` 或 `q1` 为 `null`、其似然贡献为零。舍入造成的微小负值归零，其他非有限结果视为非法输入。
+- `independence` 含 `q`、`q0`、`q1`、`lr_statistic`、`p_value`、`accepted`，其中 `p_value=erfc(sqrt(LRind/2))`；`conditional_coverage` 含 `lr_statistic`、`p_value`、`accepted`，其中 `lr_statistic=kupiec.lr_statistic+LRind`（自由度为二），`p_value=exp(-lr_statistic/2)`。两项检验分别在 `p_value>=significance` 时令 `accepted=true`。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_observation`（date 重复）、`413 request_too_large`（超过 10000 条观察；边界值允许处理）。
+
 ## 协方差估计
 
 `POST /market-risk/covariance-estimate` 根据同步风险因子收益率估计样本均值、协方差、波动率与相关系数：

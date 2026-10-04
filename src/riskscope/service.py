@@ -17,7 +17,9 @@ against caller-supplied measurements lives behind
 term-structure default probabilities and exposure forecasts lives
 behind :meth:`Service.expected_loss_schedule`. Discounted cashflow
 valuation off a zero-rate curve, with key-rate sensitivities, lives
-behind :meth:`Service.discounted_cashflow`. The public surface stays
+behind :meth:`Service.discounted_cashflow`. Christoffersen independence
+and conditional-coverage backtest validation lives behind
+:meth:`Service.var_backtest_validation`. The public surface stays
 backward compatible.
 """
 
@@ -256,6 +258,23 @@ class Service:
         :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._var_backtest(self._load_object(raw))
+
+    def var_backtest_validation(self, raw: bytes | str) -> dict:
+        """Validate a VaR backtesting request and run the Christoffersen tests.
+
+        Same input semantics, defaults, and breach determination as
+        :meth:`var_backtest`; on top of the Kupiec unconditional-coverage
+        test this runs the Christoffersen (1998) independence test on the
+        sequence of adjacent breach states (in input order) and the
+        conditional-coverage test combining both likelihood-ratio
+        statistics. The response carries everything
+        :meth:`var_backtest` returns plus the four transition counts and
+        the ``independence`` and ``conditional_coverage`` results. Parse
+        failures and non-object payloads raise :class:`InvalidRequest`;
+        semantic problems raise :class:`InvalidInput` or
+        :class:`RequestTooLarge`.
+        """
+        return self._var_backtest_validation(self._load_object(raw))
 
     def covariance_estimate(self, raw: bytes | str) -> dict:
         """Validate a covariance-estimation request and compute it.
@@ -539,6 +558,93 @@ class Service:
         return count * math.log(probability)
 
     def _var_backtest(self, payload: dict) -> dict:
+        result, _rows = self._var_backtest_core(payload)
+        return result
+
+    def _var_backtest_validation(self, payload: dict) -> dict:
+        result, rows = self._var_backtest_core(payload)
+        significance = result["significance"]
+        n = len(rows)
+
+        # Christoffersen (1998) independence test: adjacent breach states
+        # in input order form a two-state Markov chain; n01 counts a
+        # non-breach followed by a breach, and so on.
+        n00 = n01 = n10 = n11 = 0
+        for previous, current in zip(rows, rows[1:]):
+            if previous["breach"]:
+                if current["breach"]:
+                    n11 += 1
+                else:
+                    n10 += 1
+            elif current["breach"]:
+                n01 += 1
+            else:
+                n00 += 1
+
+        # Overall transition probability into a breach, and the
+        # state-conditional ones. A state with no outgoing transitions
+        # has no conditional probability (null) and contributes nothing
+        # to the likelihood.
+        q = (n01 + n11) / (n - 1)
+        q0 = n01 / (n00 + n01) if n00 + n01 > 0 else None
+        q1 = n11 / (n10 + n11) if n10 + n11 > 0 else None
+
+        term = self._kupiec_term
+        ln_l0 = term(n00 + n10, 1.0 - q) + term(n01 + n11, q)
+        ln_l1 = 0.0
+        if q0 is not None:
+            ln_l1 += term(n00, 1.0 - q0) + term(n01, q0)
+        if q1 is not None:
+            ln_l1 += term(n10, 1.0 - q1) + term(n11, q1)
+
+        # The unconstrained likelihood is maximal, so the statistic is
+        # non-negative; a small negative remainder is rounding noise.
+        lr_ind = 2.0 * (ln_l1 - ln_l0)
+        if lr_ind < 0.0:
+            lr_ind = 0.0
+        elif lr_ind == 0.0:
+            # Emit a canonical +0.0 rather than a signed zero.
+            lr_ind = 0.0
+        if not math.isfinite(lr_ind):
+            raise InvalidInput(message="backtest computation overflowed")
+        ind_p_value = math.erfc(math.sqrt(lr_ind / 2.0))
+        if not math.isfinite(ind_p_value):
+            raise InvalidInput(message="backtest computation overflowed")
+
+        # Conditional coverage combines both statistics; with two
+        # degrees of freedom the chi-squared tail is exp(-lr/2).
+        cc_lr = result["kupiec"]["lr_statistic"] + lr_ind
+        if not math.isfinite(cc_lr):
+            raise InvalidInput(message="backtest computation overflowed")
+        cc_p_value = math.exp(-cc_lr / 2.0)
+        if not math.isfinite(cc_p_value):
+            raise InvalidInput(message="backtest computation overflowed")
+
+        result["n00"] = n00
+        result["n01"] = n01
+        result["n10"] = n10
+        result["n11"] = n11
+        result["independence"] = {
+            "q": q,
+            "q0": q0,
+            "q1": q1,
+            "lr_statistic": lr_ind,
+            "p_value": ind_p_value,
+            "accepted": ind_p_value >= significance,
+        }
+        result["conditional_coverage"] = {
+            "lr_statistic": cc_lr,
+            "p_value": cc_p_value,
+            "accepted": cc_p_value >= significance,
+        }
+        return result
+
+    def _var_backtest_core(self, payload: dict) -> tuple[dict, list[dict]]:
+        """Shared validation and Kupiec computation for both backtests.
+
+        Returns the base response (as ``_var_backtest`` reports it) and
+        the validated observation rows in input order.
+        """
         currency = payload.get("currency", "USD")
         if not isinstance(currency, str) or len(currency) == 0:
             raise InvalidInput()
@@ -628,7 +734,7 @@ class Service:
                 "p_value": p_value,
                 "accepted": p_value >= significance,
             },
-        }
+        }, rows
 
     def _covariance_estimate(self, payload: dict) -> dict:
         factors_raw = payload.get("factors")
