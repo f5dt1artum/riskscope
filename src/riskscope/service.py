@@ -15,12 +15,15 @@ aggregation with FX conversion lives behind
 against caller-supplied measurements lives behind
 :meth:`Service.limit_check`. Multi-period expected credit loss from
 term-structure default probabilities and exposure forecasts lives
-behind :meth:`Service.expected_loss_schedule`. The public surface stays
+behind :meth:`Service.expected_loss_schedule`. Discounted cashflow
+valuation and interest-rate sensitivity off a zero curve live behind
+:meth:`Service.discounted_cashflow`. The public surface stays
 backward compatible.
 """
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 from decimal import Decimal, ROUND_CEILING
@@ -44,6 +47,8 @@ MAX_MEASUREMENTS = 10000
 MAX_SCHEDULE_COUNTERPARTIES = 1000
 MAX_SCHEDULE_FACILITIES = 10000
 MAX_SCHEDULE_PERIOD_FACILITY_PAIRS = 1000000
+MAX_CURVE_POINTS = 100
+MAX_DISCOUNT_CASHFLOWS = 100000
 
 # Relative tolerance for covariance-matrix symmetry, positive
 # semidefiniteness, and the tiny negative variance that floating-point
@@ -345,6 +350,29 @@ class Service:
         ``unknown_counterparty`` codes) or :class:`RequestTooLarge`.
         """
         return self._expected_loss_schedule(self._load_object(raw))
+
+    def discounted_cashflow(self, raw: bytes | str) -> dict:
+        """Validate a discounted-cashflow request and compute it.
+
+        The request declares a zero curve of at least two
+        ``curve_points`` (unique positive-integer ``day``, finite
+        ``zero_rate``, any order) and a non-empty set of ``positions``,
+        each with a unique non-empty ``id`` and non-empty ``cashflows``
+        (positive-integer ``day``, finite ``amount``). Cashflows are
+        discounted at ``exp(-zero_rate * t)`` with ``t = day / 365``;
+        the zero rate is read off the node when the day matches one and
+        linearly interpolated between adjacent nodes otherwise, and a
+        cashflow outside the curve's day range fails the whole request.
+        Each level reports ``present_value``, ``dv01`` and a
+        ``key_rate_dv01`` per curve node (ascending, zeros kept), where
+        a cashflow contributes ``amount * exp(-zero_rate * t) * t *
+        0.0001`` times its interpolation weight to each node. Parse
+        failures and non-object payloads raise :class:`InvalidRequest`;
+        semantic problems raise :class:`InvalidInput` (including the
+        ``duplicate_curve_point``, ``duplicate_position`` and
+        ``curve_out_of_range`` codes) or :class:`RequestTooLarge`.
+        """
+        return self._discounted_cashflow(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -2036,5 +2064,200 @@ class Service:
                     for index in range(period_count)
                 ],
                 "total_discounted_expected_loss": portfolio_total,
+            },
+        }
+
+    def _discounted_cashflow(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not _is_nonempty_str(currency):
+            raise InvalidInput()
+
+        curve_raw = payload.get("curve_points")
+        if not isinstance(curve_raw, list) or len(curve_raw) < 2:
+            raise InvalidInput()
+        if len(curve_raw) > MAX_CURVE_POINTS:
+            raise RequestTooLarge(
+                f"at most {MAX_CURVE_POINTS} curve points are allowed"
+            )
+        curve: list[dict] = []
+        for point in curve_raw:
+            if not isinstance(point, dict):
+                raise InvalidInput()
+            day = _strict_int(point.get("day"))
+            if day <= 0:
+                raise InvalidInput()
+            zero_rate = _strict_float(point.get("zero_rate"))
+            curve.append({"day": day, "zero_rate": zero_rate})
+
+        positions_raw = payload.get("positions")
+        if not isinstance(positions_raw, list) or len(positions_raw) == 0:
+            raise InvalidInput()
+        if len(positions_raw) > MAX_POSITIONS:
+            raise RequestTooLarge(f"at most {MAX_POSITIONS} positions are allowed")
+        positions: list[dict] = []
+        cashflow_count = 0
+        for position in positions_raw:
+            if not isinstance(position, dict):
+                raise InvalidInput()
+            position_id = position.get("id")
+            if not _is_nonempty_str(position_id):
+                raise InvalidInput()
+            cashflows_raw = position.get("cashflows")
+            if not isinstance(cashflows_raw, list) or len(cashflows_raw) == 0:
+                raise InvalidInput()
+            cashflows: list[dict] = []
+            for cashflow in cashflows_raw:
+                if not isinstance(cashflow, dict):
+                    raise InvalidInput()
+                day = _strict_int(cashflow.get("day"))
+                if day <= 0:
+                    raise InvalidInput()
+                amount = _strict_float(cashflow.get("amount"))
+                cashflows.append({"day": day, "amount": amount})
+            cashflow_count += len(cashflows)
+            positions.append({"id": position_id, "cashflows": cashflows})
+        if cashflow_count > MAX_DISCOUNT_CASHFLOWS:
+            raise RequestTooLarge(
+                f"at most {MAX_DISCOUNT_CASHFLOWS} cashflows are allowed"
+            )
+
+        seen_curve_days: set[int] = set()
+        for point in curve:
+            if point["day"] in seen_curve_days:
+                raise InvalidInput(
+                    "duplicate_curve_point", "curve point days must be unique"
+                )
+            seen_curve_days.add(point["day"])
+
+        seen_position_ids: set[str] = set()
+        for position in positions:
+            if position["id"] in seen_position_ids:
+                raise InvalidInput("duplicate_position", "position ids must be unique")
+            seen_position_ids.add(position["id"])
+
+        # The curve may arrive in any order; valuation works on the
+        # day-ascending view, which is also the order the curve and the
+        # key-rate sensitivities are reported in.
+        curve = sorted(curve, key=lambda point: point["day"])
+        node_days = [point["day"] for point in curve]
+        node_rates = [point["zero_rate"] for point in curve]
+        node_count = len(curve)
+        first_day = node_days[0]
+        last_day = node_days[-1]
+
+        def non_finite() -> InvalidInput:
+            return InvalidInput(
+                message="discount computation produced a non-finite result"
+            )
+
+        def locate(day: int) -> tuple[float, list[tuple[int, float]]]:
+            """Zero rate at ``day`` and the per-node interpolation weights."""
+            index = bisect.bisect_left(node_days, day)
+            if index < node_count and node_days[index] == day:
+                return node_rates[index], [(index, 1.0)]
+            # Out-of-range days are rejected by the caller, so the
+            # insertion point always sits strictly between two nodes.
+            lower = index - 1
+            upper = index
+            span = node_days[upper] - node_days[lower]
+            weight_upper = (day - node_days[lower]) / span
+            weight_lower = (node_days[upper] - day) / span
+            zero_rate = (
+                weight_lower * node_rates[lower] + weight_upper * node_rates[upper]
+            )
+            return zero_rate, [(lower, weight_lower), (upper, weight_upper)]
+
+        position_results: list[dict] = []
+        portfolio_present_value = 0.0
+        portfolio_node_sensitivities = [0.0] * node_count
+        for position in positions:
+            present_value = 0.0
+            node_sensitivities = [0.0] * node_count
+            for cashflow in position["cashflows"]:
+                day = cashflow["day"]
+                if day < first_day or day > last_day:
+                    raise InvalidInput(
+                        "curve_out_of_range",
+                        f"cashflow day {day} is outside the curve range",
+                    )
+                zero_rate, weights = locate(day)
+                t = day / 365
+                exponent = -zero_rate * t
+                if not math.isfinite(exponent):
+                    raise non_finite()
+                try:
+                    discount = math.exp(exponent)
+                except OverflowError:
+                    raise non_finite()
+                amount = cashflow["amount"]
+                cashflow_pv = amount * discount
+                if not math.isfinite(cashflow_pv):
+                    raise non_finite()
+                present_value += cashflow_pv
+                if not math.isfinite(present_value):
+                    raise non_finite()
+                # Sensitivity of the cashflow's present value to each
+                # curve node, distributed by interpolation weight.
+                base = cashflow_pv * t * 0.0001
+                for node_index, weight in weights:
+                    contribution = base * weight
+                    if not math.isfinite(contribution):
+                        raise non_finite()
+                    node_sensitivities[node_index] += contribution
+                    if not math.isfinite(node_sensitivities[node_index]):
+                        raise non_finite()
+
+            # dv01 is the sum of this level's per-node sensitivities,
+            # folded in ascending node order.
+            dv01 = 0.0
+            for value in node_sensitivities:
+                dv01 += value
+                if not math.isfinite(dv01):
+                    raise non_finite()
+            position_results.append(
+                {
+                    "id": position["id"],
+                    "present_value": present_value,
+                    "dv01": dv01,
+                    "key_rate_dv01": [
+                        {"day": node_days[index], "dv01": node_sensitivities[index]}
+                        for index in range(node_count)
+                    ],
+                }
+            )
+
+            # Portfolio totals are the sequential sum of the position
+            # results in input order, so the layers agree exactly.
+            portfolio_present_value += present_value
+            if not math.isfinite(portfolio_present_value):
+                raise non_finite()
+            for index in range(node_count):
+                portfolio_node_sensitivities[index] += node_sensitivities[index]
+                if not math.isfinite(portfolio_node_sensitivities[index]):
+                    raise non_finite()
+
+        portfolio_dv01 = 0.0
+        for value in portfolio_node_sensitivities:
+            portfolio_dv01 += value
+            if not math.isfinite(portfolio_dv01):
+                raise non_finite()
+
+        return {
+            "currency": currency,
+            "curve_points": [
+                {"day": point["day"], "zero_rate": point["zero_rate"]}
+                for point in curve
+            ],
+            "positions": position_results,
+            "portfolio_totals": {
+                "present_value": portfolio_present_value,
+                "dv01": portfolio_dv01,
+                "key_rate_dv01": [
+                    {
+                        "day": node_days[index],
+                        "dv01": portfolio_node_sensitivities[index],
+                    }
+                    for index in range(node_count)
+                ],
             },
         }
