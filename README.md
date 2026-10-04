@@ -121,6 +121,28 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 汇总向量 `s` 后计算 `variance = sᵀΣs`、`volatility = sqrt(variance)`、`var = z × volatility`、`expected_shortfall = φ(z) × volatility / (1 - confidence)`，其中 `z`、`φ` 为标准正态分位数与密度。响应含 `currency`、`confidence`、`factors`、按 `factors` 顺序的 `aggregate_sensitivities` 及 `variance`、`volatility`、`var`、`expected_shortfall` 四项指标。波动率为零时 `var` 与 `expected_shortfall` 均为 0.0；同一容差内的微小负 variance 按零处理，其他负值或非有限结果整次失败，不返回部分结果。
 - 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_covariance`（矩阵不对称或非半正定）、`422 duplicate_factor`、`422 duplicate_position`、`422 unknown_factor`、`422 invalid_input`（其他输入或计算错误）、`413 request_too_large`（因子超过 100 个、头寸超过 10000 个，或因子数 × 头寸数超过 1000000；边界值允许处理）。
 
+## 贴现现金流与关键利率敏感度
+
+`POST /market-risk/discounted-cashflow` 依据零息曲线对头寸现金流贴现，并计算利率敏感度：
+
+```json
+{
+  "currency": "USD",
+  "curve_points": [
+    {"day": 365, "zero_rate": 0.02},
+    {"day": 730, "zero_rate": 0.03}
+  ],
+  "positions": [
+    {"id": "p1", "cashflows": [{"day": 548, "amount": 1000.0}]}
+  ]
+}
+```
+
+- `currency` 省略时取 `USD`，否则须为非空字符串；`curve_points` 至少含两个点，每点含正整数 `day` 与有限 `zero_rate`（允许为负），`day` 不得重复、输入可乱序；`positions` 非空，每个头寸含唯一非空 `id` 与非空 `cashflows`，每笔现金流含正整数 `day` 与有限 `amount`（允许为负）。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 曲线按 `day` 升序整理；现金流恰在节点时取该节点 `zero_rate`，位于相邻节点间时按 `day` 线性插值，超出首尾节点范围则整次失败。以 `t = day / 365` 计算 `present_value = amount × exp(-zero_rate × t)`，按输入顺序累计。每笔现金流对节点的敏感度为 `amount × exp(-zero_rate × t) × t × 0.0001` 乘该节点插值权重，`dv01` 等于本层节点敏感度之和。
+- 响应回显 `currency` 与升序 `curve_points`，`positions` 保持输入顺序；头寸与 `portfolio_totals` 均含 `present_value`、`dv01` 及按节点升序、保留零值的 `key_rate_dv01`。负现金流、现值与敏感度不截断；任何中间计算产生非有限数值时整次失败，不返回部分结果。
+- 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_curve_point`（曲线 `day` 重复）、`422 duplicate_position`（头寸 `id` 重复）、`422 curve_out_of_range`（现金流越出曲线范围）、`413 request_too_large`（曲线点超过 100 个、头寸超过 10000 个，或现金流总数超过 100000；边界值允许处理）。
+
 ## 交易对手信用敞口与预期信用损失
 
 `POST /credit-risk/counterparty-exposure` 按净额结算集汇总交易敞口并计算预期损失：
