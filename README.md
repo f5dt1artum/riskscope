@@ -146,6 +146,30 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 响应回显 `currency`，按输入顺序返回 `netting_sets` 明细（含 `trade_count`，无交易的已声明结算集保留零值），按交易对手输入顺序返回 `counterparties` 汇总金额，并返回 `portfolio_totals`；各层总计等于对应明细之和。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、类型或范围错误、引用不存在、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_counterparty`、`422 duplicate_netting_set`、`422 duplicate_trade`、`413 request_too_large`（交易超过 10000 条或结算集超过 1000 个；边界值允许处理）。
 
+## 多期预期信用损失计划
+
+`POST /credit-risk/expected-loss-schedule` 用期限化违约概率与敞口预测计算信用组合的多期预期损失：
+
+```json
+{
+  "currency": "USD",
+  "periods": [1, 2, 3],
+  "discount_factors": [0.99, 0.98, 0.97],
+  "counterparties": [
+    {"id": "cp-a", "cumulative_pd": [0.01, 0.03, 0.06]}
+  ],
+  "facilities": [
+    {"id": "f-1", "counterparty_id": "cp-a", "lgd": 0.5,
+     "ead": [100.0, 200.0, 300.0]}
+  ]
+}
+```
+
+- `currency` 为非空字符串，省略时取 `USD`；`periods` 为非空、严格递增且不重复的正整数数组；`discount_factors` 与 `periods` 等长，每项为大于零且不超过 1 的有限数；`counterparties`、`facilities` 均为非空数组。交易对手含唯一非空 `id` 及与 `periods` 等长的 `cumulative_pd`，每项位于 [0, 1] 且不随期限下降；授信含唯一非空 `id`、引用已声明交易对手的 `counterparty_id`、位于 [0, 1] 的 `lgd` 及与 `periods` 等长的非负 `ead`。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 首期边际违约概率取首期 `cumulative_pd`，后续各期取相邻累计值之差；授信各期 `discounted_expected_loss = ead × lgd × 边际违约概率 × discount_factor`。
+- 响应回显 `currency` 与 `periods`，按输入顺序返回 `facilities` 明细（含 `counterparty_id`、逐期 `discounted_expected_losses` 与 `total_discounted_expected_loss`），按交易对手输入顺序返回 `counterparties` 汇总（无授信的交易对手保留全零结果），并返回同样结构的 `portfolio_total`；各层合计等于其明细之和，零值不省略。任何中间计算产生非有限数值时整次失败，不返回部分结果。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空集合、数组长度不符、期限顺序错误、类型或范围非法、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_counterparty`、`422 duplicate_facility`、`422 unknown_counterparty`、`413 request_too_large`（交易对手超过 1000 个、授信超过 10000 笔，或期限数 × 授信数超过 1000000；边界值允许处理）。
+
 ## 流动性缺口与变现折扣
 
 `POST /liquidity-risk/liquidity-gap` 按期限桶衡量资金缺口与变现折扣：
@@ -225,4 +249,4 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口、流动性缺口分析、跨账簿多币种头寸归并与风险限额评估的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口、多期预期信用损失计划、流动性缺口分析、跨账簿多币种头寸归并与风险限额评估的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。

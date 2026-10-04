@@ -13,7 +13,9 @@ estimation from synchronized factor returns lives behind
 aggregation with FX conversion lives behind
 :meth:`Service.portfolio_aggregate`. Declarative limit monitoring
 against caller-supplied measurements lives behind
-:meth:`Service.limit_check`. The public surface stays
+:meth:`Service.limit_check`. Multi-period expected loss schedules from
+term-structure default probabilities and exposure forecasts live behind
+:meth:`Service.expected_loss_schedule`. The public surface stays
 backward compatible.
 """
 
@@ -39,6 +41,9 @@ MAX_FX_RATES = 1000
 MAX_SENSITIVITY_ENTRIES = 1000000
 MAX_LIMITS = 10000
 MAX_MEASUREMENTS = 10000
+MAX_COUNTERPARTIES = 1000
+MAX_FACILITIES = 10000
+MAX_PERIOD_FACILITY_PAIRS = 1000000
 
 # Relative tolerance for covariance-matrix symmetry, positive
 # semidefiniteness, and the tiny negative variance that floating-point
@@ -321,6 +326,25 @@ class Service:
         :class:`RequestTooLarge`.
         """
         return self._limit_check(self._load_object(raw))
+
+    def expected_loss_schedule(self, raw: bytes | str) -> dict:
+        """Validate a multi-period expected loss request and compute it.
+
+        Term-structure default probabilities (``cumulative_pd`` per
+        counterparty) combine with per-period exposure forecasts (``ead``
+        per facility), ``lgd`` and ``discount_factors`` into a schedule of
+        discounted expected losses. The first period's marginal default
+        probability is the first cumulative value; later periods take the
+        difference of adjacent cumulative values. Each facility's per-period
+        ``discounted_expected_loss`` is ``ead * lgd * marginal_pd *
+        discount_factor``; results roll up by counterparty and into a
+        portfolio total. Parse failures and non-object payloads raise
+        :class:`InvalidRequest`; semantic problems raise
+        :class:`InvalidInput` (including the ``duplicate_counterparty``,
+        ``duplicate_facility`` and ``unknown_counterparty`` codes) or
+        :class:`RequestTooLarge`.
+        """
+        return self._expected_loss_schedule(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -1760,4 +1784,220 @@ class Service:
             "alerts": alerts,
             "summary": summary,
             "overall_status": overall_status,
+        }
+
+    def _expected_loss_schedule(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not _is_nonempty_str(currency):
+            raise InvalidInput()
+
+        periods_raw = payload.get("periods")
+        if not isinstance(periods_raw, list) or len(periods_raw) == 0:
+            raise InvalidInput()
+        periods: list[int] = []
+        for period in periods_raw:
+            value = _strict_int(period)
+            if value <= 0:
+                raise InvalidInput()
+            periods.append(value)
+        # Strictly increasing terms; duplicates cannot satisfy that.
+        for earlier, later in zip(periods, periods[1:]):
+            if later <= earlier:
+                raise InvalidInput(message="periods must be strictly increasing")
+
+        discount_factors_raw = payload.get("discount_factors")
+        if not isinstance(discount_factors_raw, list) or len(discount_factors_raw) != len(
+            periods
+        ):
+            raise InvalidInput()
+        discount_factors: list[float] = []
+        for value in discount_factors_raw:
+            factor = _strict_float(value)
+            if not 0.0 < factor <= 1.0:
+                raise InvalidInput()
+            discount_factors.append(factor)
+
+        counterparties_raw = payload.get("counterparties")
+        if not isinstance(counterparties_raw, list) or len(counterparties_raw) == 0:
+            raise InvalidInput()
+        if len(counterparties_raw) > MAX_COUNTERPARTIES:
+            raise RequestTooLarge(
+                f"at most {MAX_COUNTERPARTIES} counterparties are allowed"
+            )
+        counterparties: list[dict] = []
+        for counterparty in counterparties_raw:
+            if not isinstance(counterparty, dict):
+                raise InvalidInput()
+            counterparty_id = counterparty.get("id")
+            if not _is_nonempty_str(counterparty_id):
+                raise InvalidInput()
+            cumulative_pd_raw = counterparty.get("cumulative_pd")
+            if not isinstance(cumulative_pd_raw, list) or len(cumulative_pd_raw) != len(
+                periods
+            ):
+                raise InvalidInput()
+            cumulative_pd: list[float] = []
+            for value in cumulative_pd_raw:
+                pd = _strict_float(value)
+                if not 0.0 <= pd <= 1.0:
+                    raise InvalidInput()
+                cumulative_pd.append(pd)
+            # A cumulative default probability never falls with the term.
+            for earlier, later in zip(cumulative_pd, cumulative_pd[1:]):
+                if later < earlier:
+                    raise InvalidInput(
+                        message="cumulative_pd must be non-decreasing"
+                    )
+            counterparties.append({"id": counterparty_id, "cumulative_pd": cumulative_pd})
+
+        facilities_raw = payload.get("facilities")
+        if not isinstance(facilities_raw, list) or len(facilities_raw) == 0:
+            raise InvalidInput()
+        if len(facilities_raw) > MAX_FACILITIES:
+            raise RequestTooLarge(f"at most {MAX_FACILITIES} facilities are allowed")
+        if len(periods) * len(facilities_raw) > MAX_PERIOD_FACILITY_PAIRS:
+            raise RequestTooLarge(
+                "periods times facilities must not exceed "
+                f"{MAX_PERIOD_FACILITY_PAIRS}"
+            )
+        facilities: list[dict] = []
+        for facility in facilities_raw:
+            if not isinstance(facility, dict):
+                raise InvalidInput()
+            facility_id = facility.get("id")
+            if not _is_nonempty_str(facility_id):
+                raise InvalidInput()
+            counterparty_id = facility.get("counterparty_id")
+            if not _is_nonempty_str(counterparty_id):
+                raise InvalidInput()
+            lgd = _strict_float(facility.get("lgd"))
+            if not 0.0 <= lgd <= 1.0:
+                raise InvalidInput()
+            ead_raw = facility.get("ead")
+            if not isinstance(ead_raw, list) or len(ead_raw) != len(periods):
+                raise InvalidInput()
+            ead: list[float] = []
+            for value in ead_raw:
+                amount = _strict_float(value)
+                if amount < 0.0:
+                    raise InvalidInput()
+                ead.append(amount)
+            facilities.append(
+                {
+                    "id": facility_id,
+                    "counterparty_id": counterparty_id,
+                    "lgd": lgd,
+                    "ead": ead,
+                }
+            )
+
+        seen_counterparty_ids: set[str] = set()
+        for counterparty in counterparties:
+            if counterparty["id"] in seen_counterparty_ids:
+                raise InvalidInput(
+                    "duplicate_counterparty", "counterparty ids must be unique"
+                )
+            seen_counterparty_ids.add(counterparty["id"])
+
+        seen_facility_ids: set[str] = set()
+        for facility in facilities:
+            if facility["id"] in seen_facility_ids:
+                raise InvalidInput("duplicate_facility", "facility ids must be unique")
+            seen_facility_ids.add(facility["id"])
+
+        counterparty_ids = {counterparty["id"] for counterparty in counterparties}
+        for facility in facilities:
+            if facility["counterparty_id"] not in counterparty_ids:
+                raise InvalidInput(
+                    "unknown_counterparty",
+                    "facility references undeclared counterparty "
+                    f"{facility['counterparty_id']!r}",
+                )
+
+        # Marginal default probabilities: the first period takes the first
+        # cumulative value, later periods take the difference of adjacent
+        # cumulative values.
+        marginal_pd_by_counterparty: dict[str, list[float]] = {}
+        for counterparty in counterparties:
+            cumulative_pd = counterparty["cumulative_pd"]
+            marginal = [cumulative_pd[0]]
+            for earlier, later in zip(cumulative_pd, cumulative_pd[1:]):
+                marginal.append(later - earlier)
+            marginal_pd_by_counterparty[counterparty["id"]] = marginal
+
+        def check_finite(*values: float) -> None:
+            for value in values:
+                if not math.isfinite(value):
+                    raise InvalidInput(
+                        message="expected loss computation produced a non-finite result"
+                    )
+
+        facility_results: list[dict] = []
+        for facility in facilities:
+            marginal_pd = marginal_pd_by_counterparty[facility["counterparty_id"]]
+            per_period: list[float] = []
+            total = 0.0
+            for index in range(len(periods)):
+                discounted = (
+                    facility["ead"][index]
+                    * facility["lgd"]
+                    * marginal_pd[index]
+                    * discount_factors[index]
+                )
+                check_finite(discounted)
+                per_period.append(discounted)
+                total += discounted
+                check_finite(total)
+            facility_results.append(
+                {
+                    "id": facility["id"],
+                    "counterparty_id": facility["counterparty_id"],
+                    "discounted_expected_losses": per_period,
+                    "total_discounted_expected_loss": total,
+                }
+            )
+
+        # Aggregate in input order at both levels so each layer's totals are
+        # exactly the sequential sum of its details. A counterparty with no
+        # facilities keeps all-zero results.
+        counterparty_results: list[dict] = []
+        for counterparty in counterparties:
+            per_period = [0.0] * len(periods)
+            total = 0.0
+            for facility_result in facility_results:
+                if facility_result["counterparty_id"] != counterparty["id"]:
+                    continue
+                for index in range(len(periods)):
+                    per_period[index] += facility_result["discounted_expected_losses"][
+                        index
+                    ]
+                total += facility_result["total_discounted_expected_loss"]
+            check_finite(*per_period, total)
+            counterparty_results.append(
+                {
+                    "id": counterparty["id"],
+                    "discounted_expected_losses": per_period,
+                    "total_discounted_expected_loss": total,
+                }
+            )
+
+        portfolio_per_period = [0.0] * len(periods)
+        portfolio_total = 0.0
+        for counterparty_result in counterparty_results:
+            for index in range(len(periods)):
+                portfolio_per_period[index] += counterparty_result[
+                    "discounted_expected_losses"
+                ][index]
+            portfolio_total += counterparty_result["total_discounted_expected_loss"]
+        check_finite(*portfolio_per_period, portfolio_total)
+
+        return {
+            "currency": currency,
+            "periods": periods,
+            "facilities": facility_results,
+            "counterparties": counterparty_results,
+            "portfolio_total": {
+                "discounted_expected_losses": portfolio_per_period,
+                "total_discounted_expected_loss": portfolio_total,
+            },
         }
