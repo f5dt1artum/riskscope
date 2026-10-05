@@ -142,6 +142,33 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 汇总向量 `s` 后计算 `variance = sᵀΣs`、`volatility = sqrt(variance)`、`var = z × volatility`、`expected_shortfall = φ(z) × volatility / (1 - confidence)`，其中 `z`、`φ` 为标准正态分位数与密度。响应含 `currency`、`confidence`、`factors`、按 `factors` 顺序的 `aggregate_sensitivities` 及 `variance`、`volatility`、`var`、`expected_shortfall` 四项指标。波动率为零时 `var` 与 `expected_shortfall` 均为 0.0；同一容差内的微小负 variance 按零处理，其他负值或非有限结果整次失败，不返回部分结果。
 - 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_covariance`（矩阵不对称或非半正定）、`422 duplicate_factor`、`422 duplicate_position`、`422 unknown_factor`、`422 invalid_input`（其他输入或计算错误）、`413 request_too_large`（因子超过 100 个、头寸超过 10000 个，或因子数 × 头寸数超过 1000000；边界值允许处理）。
 
+## 参数法 VaR：因子与头寸归因
+
+`POST /market-risk/parametric-var-attribution` 沿用 `parametric-var` 的完整输入语义、默认值、因子/头寸顺序、协方差校验（1e-12 相对容差内对称且半正定）与规模上限，在原组合指标之外，把方差、VaR、预期损失按因子和头寸两层归因。请求体与 `parametric-var` 完全相同：
+
+```json
+{
+  "currency": "USD",
+  "confidence": 0.99,
+  "factors": ["eq", "ir"],
+  "positions": [
+    {"id": "p1", "sensitivities": {"eq": 100.0, "ir": 50.0}},
+    {"id": "p2", "sensitivities": {"eq": -20.0}}
+  ],
+  "covariance_matrix": [
+    [0.04, 0.0],
+    [0.0, 0.01]
+  ]
+}
+```
+
+- 输入校验、默认值、`covariance_matrix` 形状与半正定校验、各类数值与规模限制、错误码均与 `parametric-var` 一致；整数接受，布尔值、NaN、Infinity 与超大整数拒绝。
+- 设聚合敏感度为 `s`、协方差矩阵为 `Σ`、协方差载荷 `c = Σs`、组合方差 `variance = sᵀc`、`z`、`φ` 为标准正态分位数与密度。响应保留 `currency`、`confidence`、`factors`、`aggregate_sensitivities`、`variance`、`volatility`、`var`、`expected_shortfall`，其取值与 `parametric-var` 完全一致。
+- `factor_attributions` 按因子输入顺序返回 `factor`、`aggregate_sensitivity`、`covariance_loading`（`c_i`）、`variance_contribution = s_i × c_i`、`component_var = z × variance_contribution / volatility`、`component_expected_shortfall = φ(z) × variance_contribution / ((1 - confidence) × volatility)`。
+- `position_attributions` 按头寸输入顺序返回 `id`，以该头寸自身的敏感度向量 `p`（未引用因子补零）计算 `variance_contribution = pᵀc`，并按相同系数计算两项 component 指标。
+- 贡献可为负（不截断），零项不省略。两层的三类贡献（方差、component VaR、component 预期损失）之和分别等于对应组合值，绝对误差不超过 `1e-12 × max(1, |对应组合值|)`。组合波动率为零时，`covariance_loading` 仍按矩阵乘法返回，所有贡献均为 `0.0`。归因计算或汇总出现非有限值时整次失败，返回 `422 invalid_input` 且不含部分结果。
+- 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_covariance`、`422 duplicate_factor`、`422 duplicate_position`、`422 unknown_factor`、`422 invalid_input`、`413 request_too_large`。原 `/market-risk/parametric-var` 入口的状态码、字段与计算结果保持不变。
+
 ## 贴现现金流与关键利率敏感度
 
 `POST /market-risk/discounted-cashflow` 依据零息曲线对头寸现金流贴现，并计算利率敏感度：
