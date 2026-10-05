@@ -260,6 +260,32 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 响应回显 `currency`；`facilities` 按输入顺序返回 `id`、`counterparty_id`、`pd`、`R`、`MA`、`K`、`ead`、`capital_requirement`、`risk_weighted_assets`；`counterparties` 按交易对手输入顺序汇总 `ead`、`capital_requirement`、`risk_weighted_assets`，无授信的交易对手保留零值；`portfolio_totals` 为交易对手汇总之和，各金额不舍入。任何中间计算产生非有限数值时整次失败，不返回部分结果。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、结构、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_counterparty`、`422 duplicate_facility`、`422 unknown_counterparty`、`413 request_too_large`（交易对手超过 1000 个或授信超过 10000 笔；边界值允许处理）。
 
+## 评级迁徙预期损失
+
+`POST /credit-risk/rating-migration-loss` 把单期评级转移矩阵连续应用到请求期限，从评级迁徙推导期限化违约概率并计算预期损失：
+
+```json
+{
+  "currency": "USD",
+  "horizon": 2,
+  "ratings": ["A", "B", "D"],
+  "default_rating": "D",
+  "transition_matrix": [
+    [0.9, 0.09, 0.01],
+    [0.1, 0.8, 0.1],
+    [0.0, 0.0, 1.0]
+  ],
+  "counterparties": [
+    {"id": "cp-1", "rating": "A", "ead": 1000000.0, "lgd": 0.4}
+  ]
+}
+```
+
+- `currency` 省略时取 `USD`，否则须为非空字符串；`horizon` 为 1 到 50 的整数；`ratings` 为非空、有序且唯一的非空评级名称数组（至多 100 个）；`default_rating` 必须出现在 `ratings` 中；`transition_matrix` 为与 `ratings` 等阶的 n×n 矩阵，元素为有限非负数，每行之和在 1e-12 内等于 1，且违约行只能以概率 1 留在自身（1e-12 内的噪声按吸收态归位）；`counterparties` 为非空数组（至多 10000 条），每项含唯一非空 `id`、已声明且非违约的 `rating`、非负有限 `ead` 与位于 [0, 1] 的 `lgd`。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 期限转移矩阵为单期矩阵自乘 `horizon` 次（`M₁=P`、`M_h=M_{h-1}·P`），其第 i 行给出初始评级 `ratings[i]` 在期末落入各评级的概率；落入 `default_rating` 的概率即累计 PD。每个交易对手的 `expected_loss = ead × lgd × 累计 PD`。
+- 响应回显 `currency`、`horizon`、`ratings`、`default_rating`，返回 `horizon_transition_matrix`；`counterparties` 按输入顺序返回 `id`、`rating`、`horizon_probabilities`（按 `ratings` 顺序）、`cumulative_pd`、`ead`、`lgd`、`expected_loss`；`rating_summaries` 按 `ratings` 顺序汇总各非违约初始评级的 `counterparty_count`、`ead`、`expected_defaulted_exposure`（`ead × 累计 PD` 之和）与 `expected_loss`，无交易对手的评级组保留零值；`portfolio_totals` 为各评级汇总之和，等于交易对手明细之和。结果不舍入，距 0 或 1 不超过 1e-12 的概率归位到边界。任何中间计算产生非有限数值时整次失败，不返回部分结果。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、结构、类型或范围错误、未知或已违约评级、矩阵非法、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_rating`、`422 duplicate_counterparty`、`413 request_too_large`（评级超过 100 个、期限超过 50 或交易对手超过 10000 条；边界值允许处理）。
+
 ## 流动性缺口与变现折扣
 
 `POST /liquidity-risk/liquidity-gap` 按期限桶衡量资金缺口与变现折扣：

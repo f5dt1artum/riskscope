@@ -21,7 +21,10 @@ behind :meth:`Service.expected_loss_schedule`. Foundation-IRB capital
 requirements under the Basel corporate correlation and maturity
 adjustment live behind :meth:`Service.irb_capital`. Discounted
 cashflow valuation off a zero-rate curve, with key-rate sensitivities,
-lives behind :meth:`Service.discounted_cashflow`. The public surface
+lives behind :meth:`Service.discounted_cashflow`. Term-default
+probabilities derived from a single-period rating transition matrix,
+together with the resulting expected losses, live behind
+:meth:`Service.rating_migration_loss`. The public surface
 stays backward compatible.
 """
 
@@ -55,11 +58,18 @@ MAX_IRB_COUNTERPARTIES = 1000
 MAX_IRB_FACILITIES = 10000
 MAX_CURVE_POINTS = 100
 MAX_CASHFLOWS = 100000
+MAX_MIGRATION_RATINGS = 100
+MAX_MIGRATION_HORIZON = 50
+MAX_MIGRATION_COUNTERPARTIES = 10000
 
 # Relative tolerance for covariance-matrix symmetry, positive
 # semidefiniteness, and the tiny negative variance that floating-point
 # rounding can leave behind.
 _COVARIANCE_RTOL = 1e-12
+
+# Absolute tolerance for transition-matrix row sums, the absorbing
+# default row, and the probability snapping applied to results.
+_MIGRATION_TOLERANCE = 1e-12
 
 _STANDARD_NORMAL = NormalDist()
 
@@ -455,6 +465,27 @@ class Service:
         :class:`RequestTooLarge`.
         """
         return self._discounted_cashflow(self._load_object(raw))
+
+    def rating_migration_loss(self, raw: bytes | str) -> dict:
+        """Validate a rating-migration request and compute the losses.
+
+        The single-period ``transition_matrix`` over the ordered
+        ``ratings`` is applied ``horizon`` times, so row ``i`` of the
+        horizon matrix holds the probabilities that a name rated
+        ``ratings[i]`` today sits in each rating at the horizon; the
+        probability of landing in ``default_rating`` is the cumulative
+        PD. Each counterparty's ``expected_loss`` is
+        ``ead * lgd * cumulative_pd``. The response echoes ``currency``,
+        ``horizon``, ``ratings`` and ``default_rating``, returns the
+        horizon transition matrix, the per-counterparty details in input
+        order, a per-rating summary over the non-default initial ratings
+        in ``ratings`` order, and ``portfolio_totals``. Parse failures
+        and non-object payloads raise :class:`InvalidRequest`; semantic
+        problems raise :class:`InvalidInput` (including the
+        ``duplicate_rating`` and ``duplicate_counterparty`` codes) or
+        :class:`RequestTooLarge`.
+        """
+        return self._rating_migration_loss(self._load_object(raw))
 
     def _load_object(self, raw: bytes | str) -> dict:
         try:
@@ -2854,4 +2885,246 @@ class Service:
                     for i in range(node_count)
                 ],
             },
+        }
+
+    @staticmethod
+    def _matrix_multiply(
+        a: list[list[float]], b: list[list[float]]
+    ) -> list[list[float]]:
+        """Square matrix product ``a · b`` accumulating in column order.
+
+        Each entry sums its products in ascending column index, exactly
+        like the naive dot product; zero factors are skipped, which
+        cannot change the sum because every entry is non-negative.
+        """
+        n = len(a)
+        result = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            result_row = result[i]
+            a_row = a[i]
+            for k in range(n):
+                factor = a_row[k]
+                if factor == 0.0:
+                    continue
+                b_row = b[k]
+                for j in range(n):
+                    result_row[j] += factor * b_row[j]
+        return result
+
+    def _rating_migration_loss(self, payload: dict) -> dict:
+        currency = payload.get("currency", "USD")
+        if not _is_nonempty_str(currency):
+            raise InvalidInput()
+
+        horizon = _strict_int(payload.get("horizon"))
+        if horizon > MAX_MIGRATION_HORIZON:
+            raise RequestTooLarge(
+                f"horizon must not exceed {MAX_MIGRATION_HORIZON}"
+            )
+        if horizon < 1:
+            raise InvalidInput()
+
+        ratings_raw = payload.get("ratings")
+        if not isinstance(ratings_raw, list) or len(ratings_raw) == 0:
+            raise InvalidInput()
+        if len(ratings_raw) > MAX_MIGRATION_RATINGS:
+            raise RequestTooLarge(
+                f"at most {MAX_MIGRATION_RATINGS} ratings are allowed"
+            )
+        ratings: list[str] = []
+        for rating in ratings_raw:
+            if not _is_nonempty_str(rating):
+                raise InvalidInput()
+            ratings.append(rating)
+        seen_ratings: set[str] = set()
+        for rating in ratings:
+            if rating in seen_ratings:
+                raise InvalidInput("duplicate_rating", "rating names must be unique")
+            seen_ratings.add(rating)
+        rating_index = {rating: index for index, rating in enumerate(ratings)}
+        n = len(ratings)
+
+        default_rating = payload.get("default_rating")
+        if not _is_nonempty_str(default_rating) or default_rating not in rating_index:
+            raise InvalidInput()
+        default_index = rating_index[default_rating]
+
+        matrix_raw = payload.get("transition_matrix")
+        if not isinstance(matrix_raw, list) or len(matrix_raw) != n:
+            raise InvalidInput()
+        matrix: list[list[float]] = []
+        for row in matrix_raw:
+            if not isinstance(row, list) or len(row) != n:
+                raise InvalidInput()
+            matrix.append([_strict_float(value) for value in row])
+        for row in matrix:
+            total = 0.0
+            for value in row:
+                if value < 0.0:
+                    raise InvalidInput()
+                total += value
+            if abs(total - 1.0) > _MIGRATION_TOLERANCE:
+                raise InvalidInput(
+                    message="transition matrix rows must sum to 1"
+                )
+        # The default state is absorbing: it only stays in itself, with
+        # probability 1. Noise within tolerance is canonicalized to an
+        # exactly absorbing row so the horizon matrix keeps the property.
+        default_row = matrix[default_index]
+        for j, value in enumerate(default_row):
+            if j == default_index:
+                if abs(value - 1.0) > _MIGRATION_TOLERANCE:
+                    raise InvalidInput(
+                        message="default rating must be absorbing"
+                    )
+            elif value > _MIGRATION_TOLERANCE:
+                raise InvalidInput(
+                    message="default rating must be absorbing"
+                )
+        matrix[default_index] = [
+            1.0 if j == default_index else 0.0 for j in range(n)
+        ]
+
+        counterparties_raw = payload.get("counterparties")
+        if not isinstance(counterparties_raw, list) or len(counterparties_raw) == 0:
+            raise InvalidInput()
+        if len(counterparties_raw) > MAX_MIGRATION_COUNTERPARTIES:
+            raise RequestTooLarge(
+                f"at most {MAX_MIGRATION_COUNTERPARTIES} counterparties are allowed"
+            )
+        counterparties: list[dict] = []
+        for counterparty in counterparties_raw:
+            if not isinstance(counterparty, dict):
+                raise InvalidInput()
+            counterparty_id = counterparty.get("id")
+            if not _is_nonempty_str(counterparty_id):
+                raise InvalidInput()
+            rating = counterparty.get("rating")
+            if not _is_nonempty_str(rating) or rating not in rating_index:
+                raise InvalidInput(
+                    message="counterparty references an unknown rating"
+                )
+            if rating == default_rating:
+                raise InvalidInput(
+                    message="counterparty is already in the default rating"
+                )
+            ead = _strict_float(counterparty.get("ead"))
+            if ead < 0.0:
+                raise InvalidInput()
+            lgd = _strict_float(counterparty.get("lgd"))
+            if not 0.0 <= lgd <= 1.0:
+                raise InvalidInput()
+            counterparties.append(
+                {
+                    "id": counterparty_id,
+                    "rating": rating,
+                    "ead": ead,
+                    "lgd": lgd,
+                }
+            )
+
+        seen_counterparty_ids: set[str] = set()
+        for counterparty in counterparties:
+            if counterparty["id"] in seen_counterparty_ids:
+                raise InvalidInput(
+                    "duplicate_counterparty", "counterparty ids must be unique"
+                )
+            seen_counterparty_ids.add(counterparty["id"])
+
+        def non_finite() -> InvalidInput:
+            return InvalidInput(
+                message="migration computation produced a non-finite result"
+            )
+
+        # Apply the single-period matrix horizon times: M_1 = P and
+        # M_h = M_{h-1} · P, so row i of the horizon matrix is the
+        # horizon distribution of a name starting in ratings[i].
+        horizon_matrix = [row[:] for row in matrix]
+        for _ in range(horizon - 1):
+            horizon_matrix = self._matrix_multiply(horizon_matrix, matrix)
+        for row in horizon_matrix:
+            for value in row:
+                if not math.isfinite(value):
+                    raise non_finite()
+        # Results are not rounded, but probabilities within tolerance of
+        # 0 or 1 snap onto the boundary.
+        for row in horizon_matrix:
+            for j, value in enumerate(row):
+                if abs(value) <= _MIGRATION_TOLERANCE:
+                    row[j] = 0.0
+                elif abs(value - 1.0) <= _MIGRATION_TOLERANCE:
+                    row[j] = 1.0
+
+        amount_keys = ("ead", "expected_defaulted_exposure", "expected_loss")
+        summary_acc = {
+            rating: {
+                "counterparty_count": 0,
+                "ead": 0.0,
+                "expected_defaulted_exposure": 0.0,
+                "expected_loss": 0.0,
+            }
+            for rating in ratings
+        }
+        counterparty_results: list[dict] = []
+        for counterparty in counterparties:
+            rating = counterparty["rating"]
+            row = horizon_matrix[rating_index[rating]]
+            cumulative_pd = row[default_index]
+            ead = counterparty["ead"]
+            lgd = counterparty["lgd"]
+            expected_loss = ead * lgd * cumulative_pd
+            defaulted_exposure = ead * cumulative_pd
+            for value in (cumulative_pd, expected_loss, defaulted_exposure):
+                if not math.isfinite(value):
+                    raise non_finite()
+            counterparty_results.append(
+                {
+                    "id": counterparty["id"],
+                    "rating": rating,
+                    "horizon_probabilities": list(row),
+                    "cumulative_pd": cumulative_pd,
+                    "ead": ead,
+                    "lgd": lgd,
+                    "expected_loss": expected_loss,
+                }
+            )
+            acc = summary_acc[rating]
+            acc["counterparty_count"] += 1
+            acc["ead"] += ead
+            acc["expected_defaulted_exposure"] += defaulted_exposure
+            acc["expected_loss"] += expected_loss
+            for key in amount_keys:
+                if not math.isfinite(acc[key]):
+                    raise non_finite()
+
+        # One summary per non-default rating, in ratings order; ratings
+        # no counterparty starts from keep explicit zero values.
+        rating_summaries = [
+            {"rating": rating, **summary_acc[rating]}
+            for rating in ratings
+            if rating != default_rating
+        ]
+
+        portfolio_totals = {
+            "counterparty_count": 0,
+            "ead": 0.0,
+            "expected_defaulted_exposure": 0.0,
+            "expected_loss": 0.0,
+        }
+        for summary in rating_summaries:
+            portfolio_totals["counterparty_count"] += summary["counterparty_count"]
+            for key in amount_keys:
+                portfolio_totals[key] += summary[key]
+                if not math.isfinite(portfolio_totals[key]):
+                    raise non_finite()
+
+        return {
+            "currency": currency,
+            "horizon": horizon,
+            "ratings": ratings,
+            "default_rating": default_rating,
+            "horizon_transition_matrix": horizon_matrix,
+            "counterparties": counterparty_results,
+            "rating_summaries": rating_summaries,
+            "portfolio_totals": portfolio_totals,
         }
