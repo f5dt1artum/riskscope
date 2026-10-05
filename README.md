@@ -101,6 +101,26 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 两项检验分别在 `p_value >= significance` 时令 `accepted=true`（边界值视为接受）。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_observation`（date 重复）、`413 request_too_large`（超过 10000 条观察；边界值允许处理）。原 `/market-risk/var-backtest` 入口行为不变。
 
+## 内存中的 VaR 回溯检验（库函数）
+
+`from riskscope import backtest_var` 直接在内存中对一段已实现损益与同频率 VaR 预测做回溯检验，不经过 HTTP、不产生文件：
+
+```python
+from riskscope import backtest_var
+
+result = backtest_var(
+    realized_pnl=[5.0, -15.0, -10.0, -1.0000001],
+    var_forecast=[10.0, 10.0, 10.0, 1.0],
+    confidence_level=0.99,  # 可省略，默认 0.99
+)
+```
+
+- `realized_pnl` 与 `var_forecast` 为等长一维可迭代数值序列（普通 Python 序列与数值数组对象均可），按原顺序逐项配对，不排序、不填充缺失值，也不修改调用方对象。损益盈利为正、亏损为负；VaR 预测须为非负有限数。`confidence_level` 须位于开区间 (0, 1)。布尔值不作为数值接受。
+- 当 `realized_pnl[i] < -var_forecast[i]` 时第 i 期记为突破，相等不算突破。
+- 返回 dict 含 `confidence_level`、`observation_count`、`breach_count`、`expected_breach_count`（`n × (1 - confidence_level)`）、`breach_rate`、逐期布尔序列 `breaches`、零基 `breach_indices`、四种转移计数 `n00`/`n01`/`n10`/`n11`，以及 `kupiec`、`independence`、`conditional_coverage` 三个检验对象（各含 `lr_statistic` 与 `p_value`）。
+- 统计量使用自然对数，`0·ln0` 按零处理，舍入造成的微小负统计量归零；零次突破或全部突破同样返回有限结果。`kupiec.p_value = erfc(sqrt(lr/2))`，`independence.p_value = erfc(sqrt(lr/2))`，`conditional_coverage.lr_statistic` 为前两项之和、`p_value = exp(-lr/2)`。样本只有一期时 Kupiec 检验正常返回，独立性与条件覆盖的统计量及 p 值为 `None`。
+- `confidence_level` 越出 (0,1)、序列为空、长度不一致、含 NaN/无穷值或任一 VaR 为负时抛出 `ValueError`；输入不是一维可迭代数值序列或元素（含布尔值）不能解释为实数时抛出 `TypeError`。相同输入下结果完全确定。
+
 `POST /market-risk/covariance-estimate` 根据同步风险因子收益率估计样本均值、协方差、波动率与相关系数：
 
 ```json
