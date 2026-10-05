@@ -43,6 +43,7 @@ class Handler(BaseHTTPRequestHandler):
             "/market-risk/var-backtest-validation",
             "/market-risk/covariance-estimate",
             "/market-risk/parametric-var",
+            "/market-risk/parametric-var-attribution",
             "/market-risk/discounted-cashflow",
             "/credit-risk/counterparty-exposure",
             "/credit-risk/expected-loss-schedule",
@@ -73,6 +74,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.covariance_estimate(raw)
             elif self.path == "/market-risk/parametric-var":
                 result = self.service.parametric_var(raw)
+            elif self.path == "/market-risk/parametric-var-attribution":
+                result = self.service.parametric_var_attribution(raw)
             elif self.path == "/market-risk/discounted-cashflow":
                 result = self.service.discounted_cashflow(raw)
             elif self.path == "/credit-risk/counterparty-exposure":

@@ -19,7 +19,10 @@ behind :meth:`Service.expected_loss_schedule`. Foundation-IRB capital
 requirements under the Basel corporate correlation and maturity
 adjustment live behind :meth:`Service.irb_capital`. Discounted
 cashflow valuation off a zero-rate curve, with key-rate sensitivities,
-lives behind :meth:`Service.discounted_cashflow`. The public surface
+lives behind :meth:`Service.discounted_cashflow`. Factor- and
+position-level attribution of the parametric variance, VaR and
+expected shortfall lives behind
+:meth:`Service.parametric_var_attribution`. The public surface
 stays backward compatible.
 """
 
@@ -308,6 +311,31 @@ class Service:
         :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._parametric_var(self._load_object(raw))
+
+    def parametric_var_attribution(self, raw: bytes | str) -> dict:
+        """Validate a parametric VaR request and attribute the result.
+
+        The request semantics, defaults, ordering, covariance checks and
+        size limits are identical to :meth:`parametric_var`, and the
+        response keeps every portfolio metric of that route. On top it
+        decomposes the portfolio variance, VaR and expected shortfall
+        over factors and over positions: with the aggregate sensitivity
+        vector ``s``, covariance matrix ``Σ`` and loadings ``c = Σs``,
+        each factor reports ``variance_contribution = s_i × c_i`` and
+        each position ``variance_contribution = pᵀc`` for its own
+        sensitivity vector ``p``; the component tail metrics scale those
+        contributions by ``z / volatility`` and ``φ(z) / ((1 -
+        confidence) × volatility)``. A zero portfolio volatility keeps
+        the matrix-product loadings but zeroes every contribution.
+        Parse failures and non-object payloads raise
+        :class:`InvalidRequest`; an asymmetric or
+        non-positive-semidefinite matrix raises :class:`InvalidInput`
+        with code ``invalid_covariance``; other semantic problems raise
+        :class:`InvalidInput` or :class:`RequestTooLarge`. A non-finite
+        value anywhere in the attribution fails the whole request with
+        :class:`InvalidInput`; no partial result is returned.
+        """
+        return self._parametric_var_attribution(self._load_object(raw))
 
     def counterparty_exposure(self, raw: bytes | str) -> dict:
         """Validate a counterparty credit exposure request and compute it.
@@ -1005,7 +1033,14 @@ class Service:
                     - sum(lower[i][k] * lower[j][k] for k in range(j))
                 ) / lower[j][j]
 
-    def _parametric_var(self, payload: dict) -> dict:
+    def _parametric_var_common(self, payload: dict) -> dict:
+        """Shared validation and portfolio metrics of the parametric routes.
+
+        Both ``parametric_var`` and ``parametric_var_attribution`` accept
+        exactly this request shape and compute exactly these portfolio
+        numbers; the attribution route only adds the factor and position
+        decompositions on top.
+        """
         currency = payload.get("currency", "USD")
         if not _is_nonempty_str(currency):
             raise InvalidInput()
@@ -1097,9 +1132,11 @@ class Service:
                     message="parametric computation produced a non-finite result"
                 )
 
-        # variance = sᵀΣs, accumulated row by row. ``abs_scale`` is the
-        # matching sum of absolute terms, the yardstick for deciding
-        # whether a negative variance is mere rounding noise.
+        # Covariance loadings c = Σs and variance = sᵀc, accumulated row
+        # by row. ``abs_scale`` is the matching sum of absolute terms, the
+        # yardstick for deciding whether a negative variance is mere
+        # rounding noise.
+        loadings: list[float] = []
         variance = 0.0
         abs_scale = 0.0
         for i in range(n):
@@ -1108,6 +1145,7 @@ class Service:
             for j in range(n):
                 row_total += matrix[i][j] * aggregate[j]
                 abs_row_total += abs(matrix[i][j]) * abs(aggregate[j])
+            loadings.append(row_total)
             variance += aggregate[i] * row_total
             abs_scale += abs(aggregate[i]) * abs_row_total
         if not math.isfinite(variance):
@@ -1126,6 +1164,8 @@ class Service:
 
         volatility = math.sqrt(variance)
         if volatility == 0.0:
+            z: float | None = None
+            density: float | None = None
             var = 0.0
             expected_shortfall = 0.0
         else:
@@ -1142,11 +1182,135 @@ class Service:
             "currency": currency,
             "confidence": confidence,
             "factors": factors,
-            "aggregate_sensitivities": aggregate,
+            "positions": positions,
+            "aggregate": aggregate,
+            "loadings": loadings,
             "variance": variance,
             "volatility": volatility,
+            "z": z,
+            "density": density,
             "var": var,
             "expected_shortfall": expected_shortfall,
+        }
+
+    def _parametric_var(self, payload: dict) -> dict:
+        common = self._parametric_var_common(payload)
+        return {
+            "currency": common["currency"],
+            "confidence": common["confidence"],
+            "factors": common["factors"],
+            "aggregate_sensitivities": common["aggregate"],
+            "variance": common["variance"],
+            "volatility": common["volatility"],
+            "var": common["var"],
+            "expected_shortfall": common["expected_shortfall"],
+        }
+
+    def _parametric_var_attribution(self, payload: dict) -> dict:
+        common = self._parametric_var_common(payload)
+        currency = common["currency"]
+        confidence = common["confidence"]
+        factors = common["factors"]
+        positions = common["positions"]
+        aggregate = common["aggregate"]
+        loadings = common["loadings"]
+        volatility = common["volatility"]
+
+        def non_finite() -> InvalidInput:
+            return InvalidInput(
+                message="parametric attribution produced a non-finite result"
+            )
+
+        for loading in loadings:
+            if not math.isfinite(loading):
+                raise non_finite()
+
+        # A zero portfolio volatility zeroes every contribution but keeps
+        # the loadings as the plain matrix product. Otherwise each
+        # variance contribution scales into the tail metrics with the
+        # same coefficients at both levels, so each layer's contributions
+        # sum back onto the portfolio values.
+        zero_volatility = volatility == 0.0
+        if zero_volatility:
+            var_coeff = 0.0
+            es_coeff = 0.0
+        else:
+            var_coeff = common["z"] / volatility
+            es_coeff = common["density"] / ((1.0 - confidence) * volatility)
+
+        def components(variance_contribution: float) -> tuple[float, float]:
+            component_var = var_coeff * variance_contribution
+            component_es = es_coeff * variance_contribution
+            for value in (variance_contribution, component_var, component_es):
+                if not math.isfinite(value):
+                    raise non_finite()
+            return component_var, component_es
+
+        factor_attributions: list[dict] = []
+        factor_sums = [0.0, 0.0, 0.0]
+        for factor, sensitivity, loading in zip(factors, aggregate, loadings):
+            if zero_volatility:
+                variance_contribution = 0.0
+            else:
+                variance_contribution = sensitivity * loading
+            component_var, component_es = components(variance_contribution)
+            for k, value in enumerate(
+                (variance_contribution, component_var, component_es)
+            ):
+                factor_sums[k] += value
+                if not math.isfinite(factor_sums[k]):
+                    raise non_finite()
+            factor_attributions.append(
+                {
+                    "factor": factor,
+                    "aggregate_sensitivity": sensitivity,
+                    "covariance_loading": loading,
+                    "variance_contribution": variance_contribution,
+                    "component_var": component_var,
+                    "component_expected_shortfall": component_es,
+                }
+            )
+
+        position_attributions: list[dict] = []
+        position_sums = [0.0, 0.0, 0.0]
+        for position_id, sensitivities in positions:
+            if zero_volatility:
+                variance_contribution = 0.0
+            else:
+                # pᵀc over the position's own sensitivity vector; a
+                # factor the position does not reference contributes zero.
+                variance_contribution = 0.0
+                for j, factor in enumerate(factors):
+                    variance_contribution += (
+                        sensitivities.get(factor, 0.0) * loadings[j]
+                    )
+            component_var, component_es = components(variance_contribution)
+            for k, value in enumerate(
+                (variance_contribution, component_var, component_es)
+            ):
+                position_sums[k] += value
+                if not math.isfinite(position_sums[k]):
+                    raise non_finite()
+            position_attributions.append(
+                {
+                    "id": position_id,
+                    "variance_contribution": variance_contribution,
+                    "component_var": component_var,
+                    "component_expected_shortfall": component_es,
+                }
+            )
+
+        return {
+            "currency": currency,
+            "confidence": confidence,
+            "factors": factors,
+            "aggregate_sensitivities": aggregate,
+            "variance": common["variance"],
+            "volatility": volatility,
+            "var": common["var"],
+            "expected_shortfall": common["expected_shortfall"],
+            "factor_attributions": factor_attributions,
+            "position_attributions": position_attributions,
         }
 
     def _stress_test(self, payload: dict) -> dict:
