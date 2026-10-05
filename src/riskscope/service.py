@@ -7,7 +7,9 @@ credit exposure and expected loss live behind
 :meth:`Service.counterparty_exposure`. Liquidity gap analysis by maturity
 bucket lives behind :meth:`Service.liquidity_gap`. Sample covariance
 estimation from synchronized factor returns lives behind
-:meth:`Service.covariance_estimate`. Zero-mean Delta-Normal
+:meth:`Service.covariance_estimate`, with the RiskMetrics-style
+exponentially weighted variant behind
+:meth:`Service.ewma_covariance_estimate`. Zero-mean Delta-Normal
 (parametric) VaR and expected shortfall live behind
 :meth:`Service.parametric_var`, with their factor- and position-level
 attribution behind :meth:`Service.parametric_var_attribution`.
@@ -303,6 +305,27 @@ class Service:
         :class:`InvalidInput` or :class:`RequestTooLarge`.
         """
         return self._covariance_estimate(self._load_object(raw))
+
+    def ewma_covariance_estimate(self, raw: bytes | str) -> dict:
+        """Validate an EWMA covariance-estimation request and compute it.
+
+        The request declares the risk ``factors`` (their order fixes every
+        output vector and matrix axis), time-ordered ``observations`` of
+        ``factor_returns`` (input order is the recursion order; they are
+        never re-sorted by date) and an optional ``decay`` defaulting to
+        ``0.94`` that must lie strictly inside ``(0, 1)``. A zero-mean
+        RiskMetrics recursion starts from the first outer product
+        ``Σ₁ = r₁r₁ᵀ`` and applies ``Σₜ = decay·Σₜ₋₁ + (1 - decay)·rₜrₜᵀ``.
+        The response echoes ``factors`` and ``decay`` and reports
+        ``observation_count``, ``volatilities`` (the non-negative square
+        roots of the diagonal), ``covariance_matrix`` and
+        ``correlation_matrix`` (row/column order follows ``factors``); the
+        covariance matrix is exactly symmetric and can be passed straight
+        to :meth:`parametric_var`. Parse failures and non-object payloads
+        raise :class:`InvalidRequest`; semantic problems raise
+        :class:`InvalidInput` or :class:`RequestTooLarge`.
+        """
+        return self._ewma_covariance_estimate(self._load_object(raw))
 
     def parametric_var(self, raw: bytes | str) -> dict:
         """Validate a parametric VaR request and compute the result.
@@ -1012,6 +1035,144 @@ class Service:
             "means": means,
             "volatilities": volatilities,
             "covariance_matrix": covariance,
+            "correlation_matrix": correlation,
+        }
+
+    def _ewma_covariance_estimate(self, payload: dict) -> dict:
+        factors_raw = payload.get("factors")
+        if not isinstance(factors_raw, list) or len(factors_raw) == 0:
+            raise InvalidInput()
+        if len(factors_raw) > MAX_FACTORS:
+            raise RequestTooLarge(f"at most {MAX_FACTORS} factors are allowed")
+        factors: list[str] = []
+        for factor in factors_raw:
+            if not _is_nonempty_str(factor):
+                raise InvalidInput()
+            factors.append(factor)
+        seen_factors: set[str] = set()
+        for factor in factors:
+            if factor in seen_factors:
+                raise InvalidInput("duplicate_factor", "factor names must be unique")
+            seen_factors.add(factor)
+
+        # RiskMetrics classic daily decay; the boundary values 0 and 1 are
+        # both rejected (the recursion needs weights strictly on both terms).
+        decay = _strict_float(payload.get("decay", 0.94))
+        if not 0.0 < decay < 1.0:
+            raise InvalidInput()
+
+        observations_raw = payload.get("observations")
+        if not isinstance(observations_raw, list):
+            raise InvalidInput()
+        if len(observations_raw) > MAX_OBSERVATIONS:
+            raise RequestTooLarge(f"at most {MAX_OBSERVATIONS} observations are allowed")
+        if len(observations_raw) < 2:
+            raise InvalidInput()
+        if len(factors) * len(observations_raw) > MAX_FACTOR_OBSERVATION_PAIRS:
+            raise RequestTooLarge(
+                "factors times observations must not exceed "
+                f"{MAX_FACTOR_OBSERVATION_PAIRS}"
+            )
+
+        dates: list[str] = []
+        returns: list[list[float]] = []
+        for observation in observations_raw:
+            if not isinstance(observation, dict):
+                raise InvalidInput()
+            date = observation.get("date")
+            if not _is_nonempty_str(date):
+                raise InvalidInput()
+            factor_returns = observation.get("factor_returns")
+            if not isinstance(factor_returns, dict):
+                raise InvalidInput()
+            # Only declared factors are read; extra factors and any other
+            # observation fields are ignored.
+            row: list[float] = []
+            for factor in factors:
+                if factor not in factor_returns:
+                    raise InvalidInput(
+                        "missing_factor",
+                        f"observation {date!r} lacks factor {factor!r}",
+                    )
+                row.append(_strict_float(factor_returns[factor]))
+            dates.append(date)
+            returns.append(row)
+
+        seen_dates: set[str] = set()
+        for date in dates:
+            if date in seen_dates:
+                raise InvalidInput(
+                    "duplicate_observation", "observation dates must be unique"
+                )
+            seen_dates.add(date)
+
+        n = len(returns)
+        k = len(factors)
+        innovation_weight = 1.0 - decay
+
+        # Zero-mean RiskMetrics recursion. Σ₁ = r₁r₁ᵀ seeds the estimate,
+        # then Σₜ = decay·Σₜ₋₁ + (1-decay)·rₜrₜᵀ in observation (input)
+        # order; observations are never re-sorted by date. Each (i, j)
+        # scalar chain is reduced independently and mirrored onto both
+        # triangle halves, so the finished matrix is exactly symmetric.
+        columns = [[row[j] for row in returns] for j in range(k)]
+        covariance = [[0.0] * k for _ in range(k)]
+        for i in range(k):
+            column_i = columns[i]
+            for j in range(i, k):
+                column_j = columns[j]
+                value = column_i[0] * column_j[0]
+                for t in range(1, n):
+                    value = (
+                        decay * value
+                        + innovation_weight * column_i[t] * column_j[t]
+                    )
+                if not math.isfinite(value):
+                    raise InvalidInput(
+                        message="covariance computation produced a non-finite result"
+                    )
+                covariance[i][j] = value
+                covariance[j][i] = value
+
+        # Volatility is the non-negative square root of the diagonal; the
+        # EWMA variance is a non-negative combination of squares, so the
+        # diagonal never goes negative.
+        volatilities: list[float] = []
+        for i in range(k):
+            volatility = math.sqrt(covariance[i][i])
+            if not math.isfinite(volatility):
+                raise InvalidInput(
+                    message="covariance computation produced a non-finite result"
+                )
+            volatilities.append(volatility)
+
+        correlation = [[0.0] * k for _ in range(k)]
+        for i in range(k):
+            for j in range(i, k):
+                if volatilities[i] == 0.0 or volatilities[j] == 0.0:
+                    # A zero-volatility factor co-moves with nothing, but is
+                    # perfectly correlated with itself.
+                    value = 1.0 if i == j else 0.0
+                else:
+                    denominator = volatilities[i] * volatilities[j]
+                    if denominator == 0.0:
+                        raise InvalidInput(
+                            message="covariance computation produced a non-finite result"
+                        )
+                    value = covariance[i][j] / denominator
+                if not math.isfinite(value):
+                    raise InvalidInput(
+                        message="covariance computation produced a non-finite result"
+                    )
+                correlation[i][j] = value
+                correlation[j][i] = value
+
+        return {
+            "factors": factors,
+            "decay": decay,
+            "observation_count": n,
+            "covariance_matrix": covariance,
+            "volatilities": volatilities,
             "correlation_matrix": correlation,
         }
 

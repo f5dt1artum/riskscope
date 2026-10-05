@@ -138,6 +138,26 @@ result = backtest_var(
 - 响应回显 `factors` 并返回 `observation_count`、`means`、`volatilities`、`covariance_matrix`、`correlation_matrix`。均值为算术平均；协方差为去均值乘积之和除以 n-1；波动率为协方差对角元素的非负平方根；相关系数为协方差除以两侧波动率，零波动因子与其他因子为 0.0、自身为 1.0。矩阵对称，计算不按 `date` 排序；任一计算出现非有限值时整次失败，不返回部分结果。
 - 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空集合、类型错误、收益率非法、观察不足）、`422 duplicate_factor`、`422 duplicate_observation`、`422 missing_factor`、`413 request_too_large`（因子超过 100 个、观察超过 10000 条，或因子数 × 观察数超过 1000000；边界值允许处理）。
 
+`POST /market-risk/ewma-covariance-estimate` 以 RiskMetrics 风格的指数加权移动平均（EWMA）估计协方差、波动率与相关系数，相较样本协方差更突出近期市场变化：
+
+```json
+{
+  "factors": ["eq", "ir"],
+  "decay": 0.94,
+  "observations": [
+    {"date": "2024-01-01", "factor_returns": {"eq": 0.01, "ir": 0.02}},
+    {"date": "2024-01-02", "factor_returns": {"eq": 0.03, "ir": -0.01}},
+    {"date": "2024-01-03", "factor_returns": {"eq": -0.02, "ir": 0.0}}
+  ]
+}
+```
+
+- `factors` 为非空数组，因子名为唯一非空字符串，其顺序决定全部输出向量与矩阵的行列位置；`observations` 按时间先后排列、至少两条，每条含唯一非空 `date` 与覆盖全部声明因子的 `factor_returns`，未声明因子及其他字段忽略。输入顺序即递推顺序，不按 `date` 重排。收益率接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数。
+- `decay` 可选，默认 `0.94`；给定值须为严格位于开区间 (0, 1) 的有限数（`0`、`1`、负数、大于 1、布尔值、字符串等一律拒绝）。
+- 采用零均值收益口径：以第一条收益向量 `r₁` 初始化 `Σ₁ = r₁r₁ᵀ`，随后按 `Σₜ = decay × Σₜ₋₁ + (1 - decay) × rₜrₜᵀ` 逐条更新。每对 (i, j) 只计算一次并镜像，故 `covariance_matrix` 精确对称且半正定，可原样作为 `parametric-var` 的 `covariance_matrix` 入参。
+- 响应回显 `factors`、`decay`，并返回 `observation_count`、`covariance_matrix`、`volatilities`（对角方差的非负平方根）与 `correlation_matrix`。相关系数为协方差除以两侧波动率；零波动因子与其他因子为 0.0、与自身为 1.0；全零收益返回零协方差矩阵及上述相关矩阵。任一计算出现非有限值时整次失败，不返回部分结果。
+- 错误均通过 `{"error": {"code", "message"}}` 返回：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空集合、类型错误、收益率或 decay 非法、观察不足）、`422 duplicate_factor`、`422 duplicate_observation`、`422 missing_factor`、`413 request_too_large`（因子超过 100 个、观察超过 10000 条，或因子数 × 观察数超过 1000000；边界值允许处理）。原 `covariance-estimate`、参数法 VaR 及其他公开入口的状态码、字段、数值语义及顺序保持不变。
+
 ## 参数法 VaR（Delta-Normal）
 
 `POST /market-risk/parametric-var` 以零均值 Delta-Normal 法计算组合 VaR 与预期损失：
