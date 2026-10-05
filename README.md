@@ -260,6 +260,32 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 - 响应回显 `currency`；`facilities` 按输入顺序返回 `id`、`counterparty_id`、`pd`、`R`、`MA`、`K`、`ead`、`capital_requirement`、`risk_weighted_assets`；`counterparties` 按交易对手输入顺序汇总 `ead`、`capital_requirement`、`risk_weighted_assets`，无授信的交易对手保留零值；`portfolio_totals` 为交易对手汇总之和，各金额不舍入。任何中间计算产生非有限数值时整次失败，不返回部分结果。
 - 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、结构、类型或范围错误、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_counterparty`、`422 duplicate_facility`、`422 unknown_counterparty`、`413 request_too_large`（交易对手超过 1000 个或授信超过 10000 笔；边界值允许处理）。
 
+## 评级迁徙期限化违约概率与预期损失
+
+`POST /credit-risk/rating-migration-loss` 把单期评级转移矩阵连续应用到请求期限，从评级迁徙推导期限化违约概率并计算预期损失：
+
+```json
+{
+  "currency": "USD",
+  "horizon": 3,
+  "ratings": ["AAA", "BBB", "D"],
+  "default_rating": "D",
+  "transition_matrix": [
+    [0.95, 0.04, 0.01],
+    [0.10, 0.85, 0.05],
+    [0.0, 0.0, 1.0]
+  ],
+  "counterparties": [
+    {"id": "cp-1", "rating": "BBB", "ead": 1000000.0, "lgd": 0.45}
+  ]
+}
+```
+
+- `currency` 省略时取 `USD`，否则须为非空字符串；`horizon` 为 1 到 50 的正整数；`ratings` 为 1 至 100 个有序且唯一的非空评级名；`default_rating` 必须是其中之一；`counterparties` 为 1 至 10000 条，每条含唯一非空 `id`、引用已声明评级且不得为违约评级的 `rating`、非负有限 `ead` 与位于 [0, 1] 的 `lgd`。`transition_matrix` 为 n×n 有限非负数矩阵，每行之和在 1e-12 内等于 1，且违约态只能以概率 1 留在自身（吸收态）。数值接受整数和浮点数，拒绝布尔值、NaN、Infinity 与超大整数；额外字段忽略。
+- 期限转移矩阵为单期矩阵连续应用 `horizon` 次的结果，其第 i 行给出初始评级 i 在期末落入各评级的概率，落入违约态的概率即累计 PD。每个交易对手的 `expected_loss = ead × lgd × 累计 PD`，`expected_defaulted_exposure = ead × 累计 PD`。距 0 或 1 不超过 1e-12 的计算概率归位到边界，其余结果不舍入。任何中间计算产生非有限数值时整次失败，不返回部分结果。
+- 响应回显 `currency`、`horizon`、`ratings`、`default_rating`，并返回 `horizon_transition_matrix`；`counterparties` 按输入顺序给出 `id`、`rating`、覆盖全部评级的 `terminal_probabilities`、`cumulative_pd`、`ead`、`lgd` 与 `expected_loss`；`rating_aggregates` 按 `ratings` 顺序汇总非违约初始评级的 `counterparty_count`、`ead`、`expected_defaulted_exposure` 与 `expected_loss`（空评级组保留零值，违约评级不出现）；`portfolio_totals` 为评级汇总之和，各层汇总等于对应明细之和。
+- 错误均通过 `{"error": {"code", "message"}}` 返回且无部分结果：`400 invalid_request`（JSON 无法解析或顶层非对象）、`422 invalid_input`（字段缺失、空数组、结构、类型或范围错误、未知或已违约评级、矩阵非法、NaN/Infinity、超大整数、非有限计算结果）、`422 duplicate_rating`、`422 duplicate_counterparty`、`413 request_too_large`（评级超过 100 个或交易对手超过 10000 条；边界值允许处理）。其他公开入口行为保持不变。
+
 ## 流动性缺口与变现折扣
 
 `POST /liquidity-risk/liquidity-gap` 按期限桶衡量资金缺口与变现折扣：
@@ -339,4 +365,4 @@ PYTHONPATH=src python3 -m riskscope.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口、多期预期信用损失、F-IRB 资本要求、流动性缺口分析、跨账簿多币种头寸归并与风险限额评估的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
+健康检查、历史模拟 VaR/期望损失、批量敏感度压力测试、VaR 回溯检验、协方差估计、交易对手信用敞口、多期预期信用损失、F-IRB 资本要求、评级迁徙期限化违约概率与预期损失、流动性缺口分析、跨账簿多币种头寸归并与风险限额评估的行为均已冻结，后续能力须从这些已冻结事实出发独立设计并验证。
